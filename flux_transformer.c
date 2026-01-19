@@ -268,8 +268,8 @@ static void compute_rope_2d(float *cos_out, float *sin_out,
     int seq = patch_h * patch_w;
     (void)seq;  /* Unused but kept for documentation */
 
-    /* Precompute base frequencies: omega = 1 / (theta^(2d/dim)) for d = 0..15 */
-    float *base_freqs = (float *)malloc(half_axis * sizeof(float));
+    /* Precompute base frequencies on stack (axis_dim is always 32, half_axis=16) */
+    float base_freqs[16];
     for (int d = 0; d < half_axis; d++) {
         base_freqs[d] = 1.0f / powf(theta, (float)(2 * d) / (float)axis_dim);
     }
@@ -320,7 +320,6 @@ static void compute_rope_2d(float *cos_out, float *sin_out,
             }
         }
     }
-    free(base_freqs);
 }
 
 /* Apply 2D RoPE to image Q/K: x shape [seq, heads * head_dim]
@@ -361,8 +360,8 @@ static void compute_rope_text(float *cos_out, float *sin_out,
     int half_axis = axis_dim / 2;  /* 16 */
     int head_dim = axis_dim * 4;   /* 128 */
 
-    /* Precompute base frequencies */
-    float *base_freqs = (float *)malloc(half_axis * sizeof(float));
+    /* Precompute base frequencies on stack (axis_dim is always 32, half_axis=16) */
+    float base_freqs[16];
     for (int d = 0; d < half_axis; d++) {
         base_freqs[d] = 1.0f / powf(theta, (float)(2 * d) / (float)axis_dim);
     }
@@ -388,7 +387,6 @@ static void compute_rope_text(float *cos_out, float *sin_out,
             sin_p[axis_dim * 3 + d * 2 + 1] = sin_l;
         }
     }
-    free(base_freqs);
 }
 
 /* ========================================================================
@@ -413,24 +411,22 @@ static void get_timestep_embedding(float *out, float t, int dim, float max_perio
     }
 }
 
-/* Forward through time embedding MLP */
+/* Forward through time embedding MLP
+ * work: pre-allocated buffer of size hidden for intermediate result
+ */
 static void time_embed_forward(float *out, const float *t_sincos,
-                               const time_embed_t *te, int hidden) {
+                               const time_embed_t *te, int hidden, float *work) {
     /* MLP: fc1 (256->hidden) -> SiLU -> fc2 (hidden->hidden) */
     int sincos_dim = te->sincos_dim;
 
-    float *h = (float *)malloc(hidden * sizeof(float));
-
     /* fc1: [sincos_dim] -> [hidden] */
-    flux_linear_nobias(h, t_sincos, te->fc1_weight, 1, sincos_dim, hidden);
+    flux_linear_nobias(work, t_sincos, te->fc1_weight, 1, sincos_dim, hidden);
 
     /* SiLU */
-    flux_silu(h, hidden);
+    flux_silu(work, hidden);
 
     /* fc2: [hidden] -> [hidden] */
-    flux_linear_nobias(out, h, te->fc2_weight, 1, hidden, hidden);
-
-    free(h);
+    flux_linear_nobias(out, work, te->fc2_weight, 1, hidden, hidden);
 }
 
 /* ========================================================================
@@ -1310,13 +1306,13 @@ float *flux_transformer_forward(flux_transformer_t *tf,
 
     /* Get timestep embedding
      * FLUX.2-klein uses 256-dim sinusoidal (128 frequencies), not hidden_size
+     * Use t_emb_silu as work buffer (it's not used until double blocks)
      */
     int sincos_dim = tf->time_embed.sincos_dim;
     float *t_emb = (float *)malloc(hidden * sizeof(float));
-    float *t_sincos = (float *)malloc(sincos_dim * sizeof(float));
+    float t_sincos[256];  /* sincos_dim is always 256 */
     get_timestep_embedding(t_sincos, timestep * 1000.0f, sincos_dim, 10000.0f);
-    time_embed_forward(t_emb, t_sincos, &tf->time_embed, hidden);
-    free(t_sincos);
+    time_embed_forward(t_emb, t_sincos, &tf->time_embed, hidden, tf->t_emb_silu);
 
     /* Compute 2D RoPE frequencies for image tokens based on actual dimensions
      * img_h, img_w are the patch grid dimensions (e.g., 4x4 for 64x64 image)
@@ -1470,15 +1466,15 @@ float *flux_transformer_forward(flux_transformer_t *tf,
      * Apply SiLU to t_emb before modulation projection (FLUX architecture)
      */
     double final_start = tf_get_time_ms();
-    float *t_emb_silu = (float *)malloc(hidden * sizeof(float));
+    /* Reuse pre-allocated t_emb_silu buffer */
     for (int i = 0; i < hidden; i++) {
         float x = t_emb[i];
-        t_emb_silu[i] = x / (1.0f + expf(-x));
+        tf->t_emb_silu[i] = x / (1.0f + expf(-x));
     }
 
-    float *final_mod = (float *)malloc(hidden * 2 * sizeof(float));
-    flux_linear_nobias(final_mod, t_emb_silu, tf->final_norm_weight, 1, hidden, hidden * 2);
-    free(t_emb_silu);
+    /* Reuse double_mod_img buffer for final_mod (needs hidden*2, has hidden*6) */
+    float *final_mod = tf->double_mod_img;
+    flux_linear_nobias(final_mod, tf->t_emb_silu, tf->final_norm_weight, 1, hidden, hidden * 2);
 
     /* Python: scale, shift = mod.chunk(2, dim=1) - scale is first half, shift is second half */
     float *final_scale = final_mod;
@@ -1486,7 +1482,6 @@ float *flux_transformer_forward(flux_transformer_t *tf,
 
     float *final_norm = tf->work1;
     apply_adaln(final_norm, img_hidden, final_shift, final_scale, img_seq, hidden, 1e-6f);
-    free(final_mod);
 
     float *output_nlc = (float *)malloc(img_seq * tf->latent_channels * sizeof(float));
     LINEAR_BF16_OR_F32(output_nlc, final_norm, tf->final_proj_weight, tf->final_proj_weight_bf16,
