@@ -399,7 +399,43 @@ static void apply_adaln(float *out, const float *x,
                         int seq, int hidden, float eps) {
     /* Layer Norm (subtract mean, divide by std) + AdaLN modulation
      * Note: Flux2 uses LayerNorm with elementwise_affine=False (no learned weights)
+     * Vectorized using Accelerate framework on Apple platforms.
      */
+#if defined(__APPLE__) && defined(USE_BLAS)
+    /* Vectorized implementation using vDSP */
+    for (int s = 0; s < seq; s++) {
+        const float *x_row = x + s * hidden;
+        float *out_row = out + s * hidden;
+
+        /* Compute mean using vDSP_meanv */
+        float mean;
+        vDSP_meanv(x_row, 1, &mean, hidden);
+
+        /* Compute variance: sum((x - mean)^2) / n */
+        /* First subtract mean: temp = x - mean */
+        vDSP_vsadd(x_row, 1, &(float){-mean}, out_row, 1, hidden);
+
+        /* Then square: temp = temp^2 */
+        vDSP_vsq(out_row, 1, out_row, 1, hidden);
+
+        /* Sum the squares */
+        float var_sum;
+        vDSP_sve(out_row, 1, &var_sum, hidden);
+        float var = var_sum / hidden;
+        float std_inv = 1.0f / sqrtf(var + eps);
+
+        /* Apply normalization: out = (x - mean) * std_inv */
+        vDSP_vsadd(x_row, 1, &(float){-mean}, out_row, 1, hidden);
+        vDSP_vsmul(out_row, 1, &std_inv, out_row, 1, hidden);
+
+        /* Apply modulation: out = (1 + scale) * out + shift
+         * Could use vDSP_vma but need temp buffer; scalar loop is fast enough */
+        for (int i = 0; i < hidden; i++) {
+            out_row[i] = (1.0f + scale[i]) * out_row[i] + shift[i];
+        }
+    }
+#else
+    /* Scalar fallback */
     for (int s = 0; s < seq; s++) {
         const float *x_row = x + s * hidden;
         float *out_row = out + s * hidden;
@@ -426,13 +462,39 @@ static void apply_adaln(float *out, const float *x,
             out_row[i] = (1.0f + scale[i]) * norm + shift[i];
         }
     }
+#endif
 }
 
-/* Apply QK normalization (RMSNorm per head) */
+/* Apply QK normalization (RMSNorm per head)
+ * Vectorized using Accelerate framework on Apple platforms. */
 static void apply_qk_norm(float *q, float *k,
                           const float *q_weight, const float *k_weight,
                           int seq, int heads, int head_dim, float eps) {
-    /* Apply RMSNorm to each head of Q and K */
+#if defined(__APPLE__) && defined(USE_BLAS)
+    /* Vectorized implementation using vDSP */
+    for (int s = 0; s < seq; s++) {
+        for (int h = 0; h < heads; h++) {
+            /* Q normalization: x = x * rsqrt(mean(x^2) + eps) * weight */
+            float *qh = q + s * heads * head_dim + h * head_dim;
+            float sum_sq;
+            vDSP_svesq(qh, 1, &sum_sq, head_dim);
+            float rms_inv = 1.0f / sqrtf(sum_sq / head_dim + eps);
+
+            /* Apply: qh = qh * rms_inv * q_weight */
+            vDSP_vsmul(qh, 1, &rms_inv, qh, 1, head_dim);
+            vDSP_vmul(qh, 1, q_weight, 1, qh, 1, head_dim);
+
+            /* K normalization */
+            float *kh = k + s * heads * head_dim + h * head_dim;
+            vDSP_svesq(kh, 1, &sum_sq, head_dim);
+            rms_inv = 1.0f / sqrtf(sum_sq / head_dim + eps);
+
+            vDSP_vsmul(kh, 1, &rms_inv, kh, 1, head_dim);
+            vDSP_vmul(kh, 1, k_weight, 1, kh, 1, head_dim);
+        }
+    }
+#else
+    /* Scalar fallback */
     for (int s = 0; s < seq; s++) {
         for (int h = 0; h < heads; h++) {
             /* Q normalization */
@@ -458,6 +520,7 @@ static void apply_qk_norm(float *q, float *k,
             }
         }
     }
+#endif
 }
 
 /* ========================================================================
