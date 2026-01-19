@@ -879,6 +879,300 @@ void flux_attention_masked(float *out, const float *Q, const float *K, const flo
     free(scores);
 }
 
+/* ========================================================================
+ * Flash Attention - Memory-Efficient Tiled Attention
+ *
+ * Uses online softmax algorithm to compute attention without materializing
+ * the full [seq_q, seq_k] attention matrix. Reduces memory from O(n²) to O(n).
+ *
+ * Algorithm (for each query position):
+ * 1. Initialize: max_score = -inf, sum = 0, output = 0
+ * 2. For each key/value block:
+ *    - Compute local scores = Q @ K^T * scale
+ *    - Update running max and sum with correction factors
+ *    - Accumulate weighted values into output
+ * 3. Normalize: output /= sum
+ *
+ * Reference: "FlashAttention: Fast and Memory-Efficient Exact Attention"
+ * ======================================================================== */
+
+/*
+ * Flash attention for a single head.
+ * Q: [seq_q, head_dim], K: [seq_k, head_dim], V: [seq_k, head_dim]
+ * out: [seq_q, head_dim]
+ * Uses O(head_dim) working memory per query instead of O(seq_k).
+ */
+static void flash_attention_head(float *out,
+                                  const float *Q, const float *K, const float *V,
+                                  int seq_q, int seq_k, int head_dim, float scale) {
+    /* Process each query position independently */
+    for (int i = 0; i < seq_q; i++) {
+        const float *q_row = Q + i * head_dim;
+        float *o_row = out + i * head_dim;
+
+        /* Running statistics for online softmax */
+        float max_score = -1e30f;  /* Large negative value (avoid -INFINITY with -ffast-math) */
+        float sum_exp = 0.0f;
+
+        /* Initialize output to zero */
+        for (int d = 0; d < head_dim; d++) {
+            o_row[d] = 0.0f;
+        }
+
+        /* Iterate over all key/value positions */
+        for (int j = 0; j < seq_k; j++) {
+            const float *k_row = K + j * head_dim;
+            const float *v_row = V + j * head_dim;
+
+            /* Compute attention score: Q[i] · K[j] * scale */
+            float score = 0.0f;
+            for (int d = 0; d < head_dim; d++) {
+                score += q_row[d] * k_row[d];
+            }
+            score *= scale;
+
+            /* Online softmax update */
+            if (score > max_score) {
+                /* New maximum found - rescale previous accumulations */
+                float correction = expf(max_score - score);
+                sum_exp = sum_exp * correction + 1.0f;
+                for (int d = 0; d < head_dim; d++) {
+                    o_row[d] = o_row[d] * correction + v_row[d];
+                }
+                max_score = score;
+            } else {
+                /* Score is less than current max */
+                float weight = expf(score - max_score);
+                sum_exp += weight;
+                for (int d = 0; d < head_dim; d++) {
+                    o_row[d] += weight * v_row[d];
+                }
+            }
+        }
+
+        /* Normalize by sum */
+        float inv_sum = 1.0f / sum_exp;
+        for (int d = 0; d < head_dim; d++) {
+            o_row[d] *= inv_sum;
+        }
+    }
+}
+
+/*
+ * Flash attention with BLAS-optimized tiling.
+ * Processes queries in tiles for better cache utilization.
+ * Uses BLAS for tile-level matrix operations when available.
+ *
+ * Q: [seq_q, head_dim], K: [seq_k, head_dim], V: [seq_k, head_dim]
+ * out: [seq_q, head_dim]
+ * tile_scores: scratch buffer of size [q_tile_size, k_tile_size]
+ */
+static void flash_attention_head_tiled(float *out,
+                                        const float *Q, const float *K, const float *V,
+                                        int seq_q, int seq_k, int head_dim, float scale,
+                                        float *tile_scores, int q_tile_size, int k_tile_size) {
+    /* Per-query running statistics: max_score[seq_q], sum_exp[seq_q] */
+    float *max_scores = (float *)malloc(seq_q * sizeof(float));
+    float *sum_exps = (float *)malloc(seq_q * sizeof(float));
+
+    /* Initialize */
+    for (int i = 0; i < seq_q; i++) {
+        max_scores[i] = -1e30f;  /* Large negative value (avoid -INFINITY with -ffast-math) */
+        sum_exps[i] = 0.0f;
+    }
+    memset(out, 0, seq_q * head_dim * sizeof(float));
+
+    /* Process in tiles over K/V dimension */
+    for (int k_start = 0; k_start < seq_k; k_start += k_tile_size) {
+        int k_end = (k_start + k_tile_size < seq_k) ? k_start + k_tile_size : seq_k;
+        int k_len = k_end - k_start;
+
+        /* Process in tiles over Q dimension */
+        for (int q_start = 0; q_start < seq_q; q_start += q_tile_size) {
+            int q_end = (q_start + q_tile_size < seq_q) ? q_start + q_tile_size : seq_q;
+            int q_len = q_end - q_start;
+
+            const float *Q_tile = Q + q_start * head_dim;
+            const float *K_tile = K + k_start * head_dim;
+            const float *V_tile = V + k_start * head_dim;
+            float *out_tile = out + q_start * head_dim;
+
+            /* Compute tile scores: Q_tile @ K_tile^T * scale */
+#ifdef USE_BLAS
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        q_len, k_len, head_dim,
+                        scale, Q_tile, head_dim, K_tile, head_dim,
+                        0.0f, tile_scores, k_tile_size);
+#else
+            for (int qi = 0; qi < q_len; qi++) {
+                for (int ki = 0; ki < k_len; ki++) {
+                    float dot = 0.0f;
+                    for (int d = 0; d < head_dim; d++) {
+                        dot += Q_tile[qi * head_dim + d] * K_tile[ki * head_dim + d];
+                    }
+                    tile_scores[qi * k_tile_size + ki] = dot * scale;
+                }
+            }
+#endif
+
+            /* Online softmax update for this tile */
+            for (int qi = 0; qi < q_len; qi++) {
+                int i = q_start + qi;
+                float *score_row = tile_scores + qi * k_tile_size;
+                float *o_row = out_tile + qi * head_dim;
+
+                /* Find max in this tile */
+                float tile_max = score_row[0];
+                for (int ki = 1; ki < k_len; ki++) {
+                    if (score_row[ki] > tile_max) tile_max = score_row[ki];
+                }
+
+                /* Compute correction factors */
+                float old_max = max_scores[i];
+                float new_max = (tile_max > old_max) ? tile_max : old_max;
+
+                /* Rescale old accumulations if needed */
+                if (old_max > -1e29f) {  /* Check if we have prior accumulations */
+                    float correction = expf(old_max - new_max);
+                    sum_exps[i] *= correction;
+                    for (int d = 0; d < head_dim; d++) {
+                        o_row[d] *= correction;
+                    }
+                }
+
+                /* Accumulate this tile's contribution */
+                for (int ki = 0; ki < k_len; ki++) {
+                    float weight = expf(score_row[ki] - new_max);
+                    sum_exps[i] += weight;
+                    const float *v_row = V_tile + ki * head_dim;
+                    for (int d = 0; d < head_dim; d++) {
+                        o_row[d] += weight * v_row[d];
+                    }
+                }
+
+                max_scores[i] = new_max;
+            }
+        }
+    }
+
+    /* Final normalization */
+    for (int i = 0; i < seq_q; i++) {
+        float inv_sum = 1.0f / sum_exps[i];
+        float *o_row = out + i * head_dim;
+        for (int d = 0; d < head_dim; d++) {
+            o_row[d] *= inv_sum;
+        }
+    }
+
+    free(max_scores);
+    free(sum_exps);
+}
+
+/*
+ * Flash attention for multi-head attention.
+ * Works on [seq, heads*head_dim] layout (same as transformer tensors).
+ *
+ * Q: [seq_q, heads * head_dim]
+ * K: [seq_k, heads * head_dim]
+ * V: [seq_k, heads * head_dim]
+ * out: [seq_q, heads * head_dim]
+ *
+ * Memory usage: O(seq_q + tile_size²) instead of O(seq_q * seq_k)
+ */
+void flux_flash_attention(float *out, const float *Q, const float *K, const float *V,
+                          int seq_q, int seq_k, int heads, int head_dim, float scale) {
+    /* Tile sizes for cache efficiency */
+    int q_tile_size = 32;  /* Process 32 queries at a time */
+    int k_tile_size = 64;  /* Process 64 keys at a time */
+
+    /* Allocate tile scratch buffer */
+    float *tile_scores = (float *)malloc(q_tile_size * k_tile_size * sizeof(float));
+
+    /* Process each head */
+    for (int h = 0; h < heads; h++) {
+        const float *Q_head = Q + h * head_dim;
+        const float *K_head = K + h * head_dim;
+        const float *V_head = V + h * head_dim;
+        float *out_head = out + h * head_dim;
+
+        /* Stride between consecutive positions for this head */
+        int hidden = heads * head_dim;
+
+        /* For small sequences, use simple non-tiled version */
+        if (seq_q <= 64 && seq_k <= 128) {
+            /* Extract head data into contiguous buffers */
+            float *Q_contig = (float *)malloc(seq_q * head_dim * sizeof(float));
+            float *K_contig = (float *)malloc(seq_k * head_dim * sizeof(float));
+            float *V_contig = (float *)malloc(seq_k * head_dim * sizeof(float));
+            float *out_contig = (float *)malloc(seq_q * head_dim * sizeof(float));
+
+            for (int i = 0; i < seq_q; i++) {
+                for (int d = 0; d < head_dim; d++) {
+                    Q_contig[i * head_dim + d] = Q_head[i * hidden + d];
+                }
+            }
+            for (int j = 0; j < seq_k; j++) {
+                for (int d = 0; d < head_dim; d++) {
+                    K_contig[j * head_dim + d] = K_head[j * hidden + d];
+                    V_contig[j * head_dim + d] = V_head[j * hidden + d];
+                }
+            }
+
+            flash_attention_head(out_contig, Q_contig, K_contig, V_contig,
+                                 seq_q, seq_k, head_dim, scale);
+
+            /* Copy back with stride */
+            for (int i = 0; i < seq_q; i++) {
+                for (int d = 0; d < head_dim; d++) {
+                    out_head[i * hidden + d] = out_contig[i * head_dim + d];
+                }
+            }
+
+            free(Q_contig);
+            free(K_contig);
+            free(V_contig);
+            free(out_contig);
+        } else {
+            /* For larger sequences, use tiled version with strided access */
+            /* Extract head data into contiguous buffers for BLAS efficiency */
+            float *Q_contig = (float *)malloc(seq_q * head_dim * sizeof(float));
+            float *K_contig = (float *)malloc(seq_k * head_dim * sizeof(float));
+            float *V_contig = (float *)malloc(seq_k * head_dim * sizeof(float));
+            float *out_contig = (float *)malloc(seq_q * head_dim * sizeof(float));
+
+            for (int i = 0; i < seq_q; i++) {
+                for (int d = 0; d < head_dim; d++) {
+                    Q_contig[i * head_dim + d] = Q_head[i * hidden + d];
+                }
+            }
+            for (int j = 0; j < seq_k; j++) {
+                for (int d = 0; d < head_dim; d++) {
+                    K_contig[j * head_dim + d] = K_head[j * hidden + d];
+                    V_contig[j * head_dim + d] = V_head[j * hidden + d];
+                }
+            }
+
+            flash_attention_head_tiled(out_contig, Q_contig, K_contig, V_contig,
+                                        seq_q, seq_k, head_dim, scale,
+                                        tile_scores, q_tile_size, k_tile_size);
+
+            /* Copy back with stride */
+            for (int i = 0; i < seq_q; i++) {
+                for (int d = 0; d < head_dim; d++) {
+                    out_head[i * hidden + d] = out_contig[i * head_dim + d];
+                }
+            }
+
+            free(Q_contig);
+            free(K_contig);
+            free(V_contig);
+            free(out_contig);
+        }
+    }
+
+    free(tile_scores);
+}
+
 void flux_apply_rope(float *x, const float *freqs,
                      int batch, int seq, int heads, int head_dim) {
     /* x: [batch, seq, heads, head_dim]

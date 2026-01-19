@@ -211,6 +211,20 @@ void flux_attention_masked(float *out, const float *Q, const float *K, const flo
                            float scale);
 
 /*
+ * Flash attention - memory-efficient tiled attention.
+ * Uses online softmax to avoid materializing O(n²) attention matrix.
+ * Memory: O(seq_q + tile_size²) instead of O(seq_q × seq_k).
+ *
+ * Works on [seq, heads*head_dim] layout (same as transformer tensors).
+ * Q: [seq_q, heads * head_dim]
+ * K: [seq_k, heads * head_dim]
+ * V: [seq_k, heads * head_dim]
+ * out: [seq_q, heads * head_dim]
+ */
+void flux_flash_attention(float *out, const float *Q, const float *K, const float *V,
+                          int seq_q, int seq_k, int heads, int head_dim, float scale);
+
+/*
  * Apply rotary position embeddings (RoPE)
  * x: [batch, seq, heads, head_dim]
  * freqs: [seq, head_dim/2, 2] (cos, sin pairs)
