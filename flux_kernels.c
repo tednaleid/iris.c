@@ -7,6 +7,7 @@
 
 #include "flux_kernels.h"
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -427,11 +428,22 @@ void flux_conv2d(float *out, const float *in, const float *weight, const float *
     int outW = (W + 2 * padding - kW) / stride + 1;
 
 #ifdef USE_BLAS
-    /* im2col + BLAS optimization */
-    int col_size = in_ch * kH * kW * outH * outW;
-    float *col = malloc(col_size * sizeof(float));
+    /* im2col + BLAS optimization with tiling for large convolutions */
+    size_t col_size = (size_t)in_ch * kH * kW * outH * outW;
+    size_t max_col_size = (size_t)256 * 1024 * 1024;  /* 1GB limit */
+
+    /* For large convolutions, process in row tiles */
+    int tile_rows = outH;
+    if (col_size > max_col_size) {
+        /* Calculate how many rows we can process at once */
+        size_t row_size = (size_t)in_ch * kH * kW * outW;
+        tile_rows = (int)(max_col_size / row_size);
+        if (tile_rows < 1) tile_rows = 1;
+    }
+
+    size_t tile_col_size = (size_t)in_ch * kH * kW * tile_rows * outW;
+    float *col = malloc(tile_col_size * sizeof(float));
     if (!col) {
-        /* Fallback to naive if allocation fails */
         goto naive_fallback;
     }
 
@@ -439,15 +451,62 @@ void flux_conv2d(float *out, const float *in, const float *weight, const float *
         const float *in_b = in + b * in_ch * H * W;
         float *out_b = out + b * out_ch * outH * outW;
 
-        /* im2col: col[in_ch*kH*kW, outH*outW] */
-        im2col(in_b, col, in_ch, H, W, kH, kW, stride, padding, outH, outW);
+        /* Process in tiles of rows */
+        for (int tile_start = 0; tile_start < outH; tile_start += tile_rows) {
+            int tile_end = tile_start + tile_rows;
+            if (tile_end > outH) tile_end = outH;
+            int tile_h = tile_end - tile_start;
+            int tile_pixels = tile_h * outW;
 
-        /* BLAS: out[out_ch, outH*outW] = weight[out_ch, in_ch*kH*kW] @ col[in_ch*kH*kW, outH*outW] */
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                    out_ch, outH * outW, in_ch * kH * kW,
-                    1.0f, weight, in_ch * kH * kW,
-                    col, outH * outW,
-                    0.0f, out_b, outH * outW);
+            /* im2col for this tile: col[in_ch*kH*kW, tile_pixels] */
+            int col_row = 0;
+            for (int ic = 0; ic < in_ch; ic++) {
+                for (int kh = 0; kh < kH; kh++) {
+                    for (int kw = 0; kw < kW; kw++) {
+                        for (int oh = tile_start; oh < tile_end; oh++) {
+                            for (int ow = 0; ow < outW; ow++) {
+                                int ih = oh * stride - padding + kh;
+                                int iw = ow * stride - padding + kw;
+                                int col_idx = col_row * tile_pixels + (oh - tile_start) * outW + ow;
+                                if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
+                                    col[col_idx] = in_b[ic * H * W + ih * W + iw];
+                                } else {
+                                    col[col_idx] = 0.0f;
+                                }
+                            }
+                        }
+                        col_row++;
+                    }
+                }
+            }
+
+            /* BLAS sgemm: tmp[out_ch, tile_pixels] = weight[out_ch, K] @ col[K, tile_pixels]
+             * where K = in_ch * kH * kW */
+            int K = in_ch * kH * kW;
+
+            /* Allocate temporary contiguous buffer for tile output */
+            float *tmp = malloc((size_t)out_ch * tile_pixels * sizeof(float));
+            if (!tmp) {
+                free(col);
+                goto naive_fallback;
+            }
+
+            /* sgemm: tmp[out_ch, tile_pixels] = weight[out_ch, K] @ col[K, tile_pixels] */
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        out_ch, tile_pixels, K,
+                        1.0f, weight, K,
+                        col, tile_pixels,
+                        0.0f, tmp, tile_pixels);
+
+            /* Scatter tile output to correct positions in out_b */
+            for (int oc = 0; oc < out_ch; oc++) {
+                float *out_tile = out_b + oc * outH * outW + tile_start * outW;
+                float *tmp_row = tmp + oc * tile_pixels;
+                memcpy(out_tile, tmp_row, tile_pixels * sizeof(float));
+            }
+
+            free(tmp);
+        }
 
         /* Add bias */
         if (bias != NULL) {
