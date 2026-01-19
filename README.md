@@ -115,6 +115,26 @@ To reproduce the same image, use the printed seed:
 $ ./flux -d flux-klein-model -p "a landscape" -o out.png -S 1705612345
 ```
 
+### PNG Metadata
+
+Generated PNG images include metadata with the seed and model information, so you can always recover the seed even if you didn't save the terminal output:
+
+```bash
+# Using exiftool
+exiftool image.png | grep flux
+
+# Using Python/PIL
+python3 -c "from PIL import Image; print(Image.open('image.png').info)"
+
+# Using ImageMagick
+identify -verbose image.png | grep -A1 "Properties:"
+```
+
+The following metadata fields are stored:
+- `flux:seed` - The random seed used for generation
+- `flux:model` - The model name (FLUX.2-klein-4B)
+- `Software` - Program identifier
+
 ## Building
 
 Choose a backend when building:

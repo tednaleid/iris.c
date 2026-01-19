@@ -251,7 +251,24 @@ static void write_png_chunk(FILE *f, const char *type, const uint8_t *data, size
     fwrite(crc_bytes, 1, 4, f);
 }
 
-static int save_png(const flux_image *img, FILE *f) {
+/* Write PNG tEXt chunk (uncompressed text metadata) */
+static void write_png_text_chunk(FILE *f, const char *keyword, const char *text) {
+    size_t key_len = strlen(keyword);
+    size_t text_len = strlen(text);
+    size_t data_len = key_len + 1 + text_len;  /* keyword + null + text */
+
+    uint8_t *data = (uint8_t *)malloc(data_len);
+    if (!data) return;
+
+    memcpy(data, keyword, key_len);
+    data[key_len] = 0;  /* Null separator */
+    memcpy(data + key_len + 1, text, text_len);
+
+    write_png_chunk(f, "tEXt", data, data_len);
+    free(data);
+}
+
+static int save_png_with_metadata(const flux_image *img, FILE *f, int64_t seed, int has_seed) {
     /* PNG signature */
     const uint8_t signature[8] = {0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a};
     fwrite(signature, 1, 8, f);
@@ -274,6 +291,15 @@ static int save_png(const flux_image *img, FILE *f) {
     ihdr[12] = 0;  /* Interlace */
 
     write_png_chunk(f, "IHDR", ihdr, 13);
+
+    /* Write metadata as tEXt chunks */
+    if (has_seed) {
+        char seed_str[32];
+        snprintf(seed_str, sizeof(seed_str), "%lld", (long long)seed);
+        write_png_text_chunk(f, "flux:seed", seed_str);
+        write_png_text_chunk(f, "Software", "flux (https://github.com/antirez/flux-c)");
+        write_png_text_chunk(f, "flux:model", "FLUX.2-klein-4B");
+    }
 
     /* Prepare raw image data with filter bytes */
     int channels = img->channels;
@@ -316,6 +342,10 @@ static int save_png(const flux_image *img, FILE *f) {
     write_png_chunk(f, "IEND", NULL, 0);
 
     return 0;
+}
+
+static int save_png(const flux_image *img, FILE *f) {
+    return save_png_with_metadata(img, f, 0, 0);
 }
 
 /* Read 4-byte big-endian integer */
@@ -829,6 +859,29 @@ int flux_image_save(const flux_image *img, const char *path) {
     } else {
         /* Default to PNG */
         result = save_png(img, f);
+    }
+
+    fclose(f);
+    return result;
+}
+
+int flux_image_save_with_seed(const flux_image *img, const char *path, int64_t seed) {
+    if (!img || !path) return -1;
+
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+
+    int result;
+    const char *ext = get_extension(path);
+
+    if (strcasecmp(ext, "png") == 0) {
+        result = save_png_with_metadata(img, f, seed, 1);
+    } else if (strcasecmp(ext, "ppm") == 0 || strcasecmp(ext, "pgm") == 0) {
+        /* PPM doesn't support metadata, just save normally */
+        result = save_ppm(img, f);
+    } else {
+        /* Default to PNG with seed */
+        result = save_png_with_metadata(img, f, seed, 1);
     }
 
     fclose(f);

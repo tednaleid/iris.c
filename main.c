@@ -527,7 +527,7 @@ int main(int argc, char *argv[]) {
     if (output_level >= OUTPUT_NORMAL) fflush(stderr);
     timer_begin();
 
-    if (flux_image_save(output, output_path) != 0) {
+    if (flux_image_save_with_seed(output, output_path, actual_seed) != 0) {
         fprintf(stderr, "\nError: Failed to save image: %s\n", output_path);
         flux_image_free(output);
         flux_free(ctx);

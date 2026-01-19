@@ -181,6 +181,13 @@ flux_image *flux_image_load(const char *path);
 int flux_image_save(const flux_image *img, const char *path);
 
 /*
+ * Save image to PNG with seed embedded as metadata.
+ * The seed is stored in a tEXt chunk with keyword "flux:seed".
+ * Returns 0 on success, -1 on error.
+ */
+int flux_image_save_with_seed(const flux_image *img, const char *path, int64_t seed);
+
+/*
  * Create a new image with given dimensions.
  */
 flux_image *flux_image_create(int width, int height, int channels);
