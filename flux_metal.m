@@ -425,6 +425,207 @@ void flux_metal_sgemm(int transpose_a, int transpose_b,
     }
 }
 
+/* Convert bf16 to f16 for MPS compatibility
+ * MPS only supports mixed precision with f16, not bf16 */
+static inline uint16_t bf16_to_f16(uint16_t bf16) {
+    /* bf16: sign(1) + exp(8) + mant(7)
+     * f16:  sign(1) + exp(5) + mant(10)
+     * We need to rebias the exponent and handle special cases */
+    uint32_t sign = (bf16 >> 15) & 0x1;
+    int32_t exp = (bf16 >> 7) & 0xFF;  /* bf16 exponent (bias 127) */
+    uint32_t mant = bf16 & 0x7F;       /* bf16 mantissa (7 bits) */
+
+    if (exp == 0) {
+        /* Zero or denormal -> zero in f16 (denormals too small) */
+        return (uint16_t)(sign << 15);
+    } else if (exp == 0xFF) {
+        /* Inf or NaN */
+        return (uint16_t)((sign << 15) | 0x7C00 | (mant ? 0x200 : 0));
+    }
+
+    /* Rebias: bf16 bias=127, f16 bias=15 */
+    int32_t new_exp = exp - 127 + 15;
+
+    if (new_exp <= 0) {
+        /* Underflow to zero */
+        return (uint16_t)(sign << 15);
+    } else if (new_exp >= 31) {
+        /* Overflow to infinity */
+        return (uint16_t)((sign << 15) | 0x7C00);
+    }
+
+    /* Normal case: shift mantissa from 7 bits to 10 bits */
+    uint32_t new_mant = mant << 3;  /* 7 -> 10 bits */
+    return (uint16_t)((sign << 15) | (new_exp << 10) | new_mant);
+}
+
+/* F16 weight cache (stores bf16 weights converted to f16 for MPS) */
+#define F16_WEIGHT_CACHE_SIZE 512
+
+typedef struct {
+    const void *cpu_ptr;
+    id<MTLBuffer> gpu_buffer;
+    size_t size;
+} f16_cache_entry_t;
+
+static f16_cache_entry_t g_f16_cache[F16_WEIGHT_CACHE_SIZE];
+static int g_f16_cache_count = 0;
+static pthread_mutex_t g_f16_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Get bf16 weights as f16 buffer for MPS */
+static id<MTLBuffer> get_cached_bf16_as_f16_buffer(const uint16_t *weights, size_t num_elements) {
+    pthread_mutex_lock(&g_f16_cache_mutex);
+
+    /* Look for existing entry */
+    for (int i = 0; i < g_f16_cache_count; i++) {
+        if (g_f16_cache[i].cpu_ptr == weights) {
+            id<MTLBuffer> buf = g_f16_cache[i].gpu_buffer;
+            pthread_mutex_unlock(&g_f16_cache_mutex);
+            return buf;
+        }
+    }
+
+    /* Convert bf16 to f16 */
+    uint16_t *f16_data = malloc(num_elements * sizeof(uint16_t));
+    if (!f16_data) {
+        pthread_mutex_unlock(&g_f16_cache_mutex);
+        return nil;
+    }
+    for (size_t i = 0; i < num_elements; i++) {
+        f16_data[i] = bf16_to_f16(weights[i]);
+    }
+
+    size_t size = num_elements * sizeof(uint16_t);
+
+    /* Cache is full - just create buffer without caching */
+    if (g_f16_cache_count >= F16_WEIGHT_CACHE_SIZE) {
+        id<MTLBuffer> buf = [g_device newBufferWithBytes:f16_data
+                                                  length:size
+                                                 options:MTLResourceStorageModeShared];
+        free(f16_data);
+        pthread_mutex_unlock(&g_f16_cache_mutex);
+        return buf;
+    }
+
+    /* Create and cache */
+    id<MTLBuffer> buf = [g_device newBufferWithBytes:f16_data
+                                              length:size
+                                             options:MTLResourceStorageModeShared];
+    free(f16_data);
+
+    g_f16_cache[g_f16_cache_count].cpu_ptr = weights;
+    g_f16_cache[g_f16_cache_count].gpu_buffer = buf;
+    g_f16_cache[g_f16_cache_count].size = size;
+    g_f16_cache_count++;
+
+    pthread_mutex_unlock(&g_f16_cache_mutex);
+    return buf;
+}
+
+/*
+ * BF16 matrix multiplication: C = alpha * A @ B + beta * C
+ * A is f32, B is bf16 (weights, converted to f16 for MPS), C is f32
+ * This provides 2x memory bandwidth for weights.
+ * Note: bf16 is converted to f16 because MPS only supports mixed f32/f16 matmul.
+ */
+void flux_metal_sgemm_bf16(int transpose_a, int transpose_b,
+                           int M, int N, int K,
+                           float alpha,
+                           const float *A, int lda,
+                           const uint16_t *B_bf16, int ldb,
+                           float beta,
+                           float *C, int ldc) {
+    if (!g_initialized) return;
+
+    @autoreleasepool {
+        int rowsA = transpose_a ? K : M;
+        int colsA = transpose_a ? M : K;
+        int rowsB = transpose_b ? N : K;
+        int colsB = transpose_b ? K : N;
+
+        size_t sizeA = (size_t)rowsA * lda * sizeof(float);
+        size_t numB = (size_t)rowsB * ldb;  /* Number of bf16 elements */
+        size_t sizeC = (size_t)M * ldc * sizeof(float);
+
+        /* Get cached f16 weight buffer (bf16 converted to f16) */
+        id<MTLBuffer> bufferB = get_cached_bf16_as_f16_buffer(B_bf16, numB);
+
+        /* Use pooled buffers for activations */
+        id<MTLBuffer> bufferA = pool_get_buffer(sizeA);
+        id<MTLBuffer> bufferC = pool_get_buffer(sizeC);
+
+        if (!bufferA || !bufferB || !bufferC) {
+            if (bufferA) pool_release_buffer(bufferA);
+            if (bufferC) pool_release_buffer(bufferC);
+            return;
+        }
+
+        memcpy([bufferA contents], A, sizeA);
+        if (beta != 0.0f) {
+            memcpy([bufferC contents], C, sizeC);
+        }
+
+        /* Create matrix descriptors - B uses Float16 (converted from bf16) */
+        MPSMatrixDescriptor *descA = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:rowsA columns:colsA
+                            rowBytes:lda * sizeof(float)
+                            dataType:MPSDataTypeFloat32];
+
+        MPSMatrixDescriptor *descB = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:rowsB columns:colsB
+                            rowBytes:ldb * sizeof(uint16_t)
+                            dataType:MPSDataTypeFloat16];
+
+        MPSMatrixDescriptor *descC = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:M columns:N
+                            rowBytes:ldc * sizeof(float)
+                            dataType:MPSDataTypeFloat32];
+
+        MPSMatrix *matrixA = [[MPSMatrix alloc] initWithBuffer:bufferA descriptor:descA];
+        MPSMatrix *matrixB = [[MPSMatrix alloc] initWithBuffer:bufferB descriptor:descB];
+        MPSMatrix *matrixC = [[MPSMatrix alloc] initWithBuffer:bufferC descriptor:descC];
+
+        MPSMatrixMultiplication *matmul = [[MPSMatrixMultiplication alloc]
+            initWithDevice:g_device
+               transposeLeft:transpose_a ? YES : NO
+              transposeRight:transpose_b ? YES : NO
+                  resultRows:M
+               resultColumns:N
+             interiorColumns:K
+                       alpha:alpha
+                        beta:beta];
+
+        id<MTLCommandBuffer> cmdBuffer = g_in_batch ? g_batch_cmd : [g_queue commandBuffer];
+
+        [matmul encodeToCommandBuffer:cmdBuffer
+                           leftMatrix:matrixA
+                          rightMatrix:matrixB
+                         resultMatrix:matrixC];
+
+        if (g_in_batch) {
+            if (g_pending_count < MAX_BATCH_OUTPUTS) {
+                g_pending_outputs[g_pending_count].buffer = bufferC;
+                g_pending_outputs[g_pending_count].cpu_ptr = C;
+                g_pending_outputs[g_pending_count].size = sizeC;
+                g_pending_count++;
+                pool_release_buffer(bufferA);
+            } else {
+                [cmdBuffer commit];
+                [cmdBuffer waitUntilCompleted];
+                memcpy(C, [bufferC contents], sizeC);
+                pool_release_buffer(bufferA);
+                pool_release_buffer(bufferC);
+            }
+        } else {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            memcpy(C, [bufferC contents], sizeC);
+            pool_release_buffer(bufferA);
+            pool_release_buffer(bufferC);
+        }
+    }
+}
+
 void flux_metal_sgemm_batch(int transpose_a, int transpose_b,
                             int M, int N, int K,
                             float alpha,

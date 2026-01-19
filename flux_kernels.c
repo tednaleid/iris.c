@@ -325,6 +325,44 @@ void flux_linear_nobias(float *y, const float *x, const float *W,
     flux_linear(y, x, W, NULL, seq_len, in_dim, out_dim);
 }
 
+void flux_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
+                             int seq_len, int in_dim, int out_dim) {
+    /* y[seq, out] = x[seq, in] @ W[out, in]^T */
+
+#ifdef USE_METAL
+    /* Use Metal GPU for bf16 matmul - provides 2x memory bandwidth */
+    size_t matrix_elements = (size_t)seq_len * out_dim;
+    if (flux_metal_available() && matrix_elements >= MIN_GPU_ELEMENTS) {
+        /* Metal bf16 sgemm: C = alpha * A @ B^T
+         * A[M, K] = x[seq_len, in_dim] (f32)
+         * B[N, K] = W[out_dim, in_dim] (bf16, transposed)
+         * C[M, N] = y[seq_len, out_dim] (f32)
+         */
+        flux_metal_sgemm_bf16(0, 1,  /* no transpose A, transpose B */
+                              seq_len, out_dim, in_dim,
+                              1.0f,
+                              x, in_dim,
+                              W_bf16, in_dim,
+                              0.0f,
+                              y, out_dim);
+        return;
+    }
+#endif
+
+    /* Fallback: convert bf16 to f32 and use regular linear */
+    float *W_f32 = (float *)malloc((size_t)out_dim * in_dim * sizeof(float));
+    if (!W_f32) return;
+
+    /* Convert bf16 to f32 */
+    for (int i = 0; i < out_dim * in_dim; i++) {
+        uint32_t f32_bits = ((uint32_t)W_bf16[i]) << 16;
+        memcpy(&W_f32[i], &f32_bits, sizeof(float));
+    }
+
+    flux_linear_nobias(y, x, W_f32, seq_len, in_dim, out_dim);
+    free(W_f32);
+}
+
 /* ========================================================================
  * GPU Batch Operations
  * ======================================================================== */

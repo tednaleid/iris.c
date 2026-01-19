@@ -68,6 +68,14 @@ void flux_linear(float *y, const float *x, const float *W, const float *b,
 void flux_linear_nobias(float *y, const float *x, const float *W,
                         int seq_len, int in_dim, int out_dim);
 
+/*
+ * Linear layer without bias using bf16 weights
+ * x: [seq_len, in_dim] (f32), W: [out_dim, in_dim] (bf16), y: [seq_len, out_dim] (f32)
+ * Provides 2x memory bandwidth improvement for weight-bound operations.
+ */
+void flux_linear_nobias_bf16(float *y, const float *x, const uint16_t *W_bf16,
+                             int seq_len, int in_dim, int out_dim);
+
 /* ========================================================================
  * GPU Batch Operations
  * These functions allow batching multiple GPU operations to reduce sync overhead.

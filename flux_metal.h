@@ -9,6 +9,7 @@
 #define FLUX_METAL_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -45,6 +46,21 @@ void flux_metal_sgemm(int transpose_a, int transpose_b,
                       const float *B, int ldb,
                       float beta,
                       float *C, int ldc);
+
+/*
+ * GPU-accelerated matrix multiplication with bf16 weights.
+ * C[M,N] = alpha * A[M,K] @ B[K,N] + beta * C[M,N]
+ *
+ * A is f32, B is bf16 (weights), C is f32
+ * This provides 2x memory bandwidth improvement for weight-bound operations.
+ */
+void flux_metal_sgemm_bf16(int transpose_a, int transpose_b,
+                           int M, int N, int K,
+                           float alpha,
+                           const float *A, int lda,
+                           const uint16_t *B_bf16, int ldb,
+                           float beta,
+                           float *C, int ldc);
 
 /*
  * Batch matrix multiplication on GPU.
