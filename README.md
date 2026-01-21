@@ -2,14 +2,6 @@
 
 This program generates images from text prompts (and optionally from other images) using the FLUX.2-klein-4B model from Black Forest Labs. It can be used as a library as well, and is implemented entirely in C, with zero external dependencies beyond the C standard library. MPS and BLAS acceleration are optional but recommended.
 
-## An experiment in AI code generation and open source software
-
-I (the human here, Salvatore) wanted to test code generation with a more ambitious task, over the weekend. This is the result. It is my first open source project where I wrote zero lines of code. I believe that inference systems not using the Python stack (which I do not appreciate) are a way to free open models usage and make AI more accessible. There is already a project [doing the inference of diffusion models in C / C++](https://github.com/leejet/stable-diffusion.cpp) that supports multiple models, and is based on GGML. I wanted to see if, with the assistance of modern AI, I could reproduce this work in a more concise way, from scratch, in a weekend. Looks like it is possible.
-
-This code base was written with Claude Code, using the Claude Max plan, the small one of ~80 euros per month. I almost reached the limits but this plan was definitely sufficient for such a large task, which was surprising. In order to simplify the usage of this software, no quantization is used, nor do you need to convert the model. It runs directly with the safetensors model as input, using floats.
-
-Even if the code was generated using AI, my help in steering towards the right design, implementation choices, and correctness has been vital during the development. I learned quite a few things about working with non trivial projects and AI.
-
 ## Quick Start
 
 ```bash
@@ -26,7 +18,7 @@ python download_model.py
 ./flux -d flux-klein-model -p "A woman wearing sunglasses" -o output.png
 ```
 
-That's it. No Python runtime, no PyTorch, no CUDA toolkit required at inference time.
+That's it. No Python runtime or CUDA toolkit required at inference time.
 
 ## Example Output
 
@@ -257,17 +249,25 @@ This reduces peak memory from ~16GB to ~4-5GB, making inference possible on syst
 
 Benchmarks on **Apple M3 Max** (128GB RAM), generating a 4-step image.
 
-**Important:** Previous benchmarks in this README were misleading - they compared C timings (which included model loading) against PyTorch timings (which excluded loading and used warmup runs). The table below shows fair "cold start" benchmarks where all implementations include model loading time and no warmup:
+**Important:** Previous benchmarks in this README were misleading - they compared C timings (which included model loading) against reference timings (which excluded loading and used warmup runs). The table below shows fair "cold start" benchmarks where all implementations include model loading time and no warmup:
 
-| Size | C (MPS) | C (BLAS) | PyTorch (MPS) |
+| Size | C (MPS) | C (BLAS) | Reference (MPS) |
 |------|---------|----------|---------------|
-| 256x256 | 22s | 24s | 11s |
-| 512x512 | 30s | 44s | 13s |
+| 256x256 | 23s | 24s | 11s |
+| 512x512 | 26s | 44s | 13s |
+
+**Denoising-only times** (excluding model loading, for batch generation):
+
+| Size | C (MPS) Denoising |
+|------|-------------------|
+| 256x256 | 4.0s |
+| 512x512 | 3.2s |
 
 **Notes:**
 - All times measured with `time` command (wall clock), including model loading, no warmup.
-- The C MPS implementation uses bf16 weights on GPU. The C BLAS implementation uses float32 throughout.
-- PyTorch benefits from keeping activations on GPU between operations; the C implementation currently transfers data between CPU and GPU for each operation.
+- The C MPS implementation uses bf16 weights on GPU with optimized batch processing. The C BLAS implementation uses float32 throughout.
+- The reference implementation benefits from keeping activations on GPU between operations; the C implementation currently transfers data between CPU and GPU for each operation.
+- For batch generation (multiple images), only the denoising time matters after the first image. The MPS backend achieves ~4s per image at 256x256.
 - The `make generic` backend (pure C, no BLAS) is approximately 30x slower than BLAS and not included in benchmarks.
 
 ### Resolution Limits

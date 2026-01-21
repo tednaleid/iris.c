@@ -9,7 +9,11 @@
  */
 
 #include <metal_stdlib>
+#include <metal_simdgroup>
 using namespace metal;
+
+inline float bf16_to_f32(ushort bf16);
+inline ushort f32_to_bf16(float f32);
 
 /* ========================================================================
  * RMSNorm: out[i] = x[i] * rsqrt(mean(x^2) + eps) * weight[i]
@@ -395,6 +399,43 @@ kernel void apply_rope_2d(
     }
 }
 
+/* Apply 2D RoPE to bf16 Q or K tensor
+ * x: [seq, heads*head_dim] (bf16)
+ * cos, sin: [seq, head_dim] (f32)
+ */
+kernel void apply_rope_2d_bf16(
+    device ushort *x [[buffer(0)]],
+    device const float *cos_freq [[buffer(1)]],
+    device const float *sin_freq [[buffer(2)]],
+    constant int &seq [[buffer(3)]],
+    constant int &heads [[buffer(4)]],
+    constant int &head_dim [[buffer(5)]],
+    constant int &axis_dim [[buffer(6)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint seq_idx = pos.x;
+    uint head_idx = pos.y;
+
+    if (seq_idx >= uint(seq) || head_idx >= uint(heads)) return;
+
+    uint hidden = heads * head_dim;
+    device ushort *vec = x + seq_idx * hidden + head_idx * head_dim;
+    device const float *cos_row = cos_freq + seq_idx * head_dim;
+    device const float *sin_row = sin_freq + seq_idx * head_dim;
+
+    (void)axis_dim;
+    for (int d = 0; d < head_dim; d += 2) {
+        float c = cos_row[d];
+        float s = sin_row[d];
+
+        float x0 = bf16_to_f32(vec[d]);
+        float x1 = bf16_to_f32(vec[d + 1]);
+
+        vec[d] = f32_to_bf16(x0 * c - x1 * s);
+        vec[d + 1] = f32_to_bf16(x1 * c + x0 * s);
+    }
+}
+
 /* ========================================================================
  * Unified RoPE for Text+Image (Single Block Forward)
  * Applies different frequency tables to text and image portions in one pass.
@@ -706,5 +747,998 @@ kernel void causal_attention_fused(
             }
         }
         out_row[d] = acc;
+    }
+}
+
+/* ========================================================================
+ * Half-Precision Batched Matrix Multiply for Attention
+ *
+ * Tiled implementation with f32 accumulation for numerical stability.
+ * Works directly with half-precision data.
+ * ======================================================================== */
+
+constant uint TILE_SIZE = 16;
+
+/* Batched matmul for Q @ K^T (transposes K)
+ * Q: [batch, M, K] (half)
+ * K: [batch, N, K] (half) - note: N is seq_k, accessed transposed
+ * out: [batch, M, N] (half)
+ * For attention: M=seq_q, N=seq_k, K=head_dim
+ */
+kernel void batched_matmul_half_qkt(
+    device const half *Q [[buffer(0)]],
+    device const half *K [[buffer(1)]],
+    device half *out [[buffer(2)]],
+    constant int &M [[buffer(3)]],      // seq_q
+    constant int &N [[buffer(4)]],      // seq_k
+    constant int &K_dim [[buffer(5)]],  // head_dim
+    constant int &batch [[buffer(6)]],  // num_heads
+    constant float &scale [[buffer(7)]],
+    uint3 tid [[thread_position_in_threadgroup]],
+    uint3 group_id [[threadgroup_position_in_grid]]
+) {
+    threadgroup half A_tile[TILE_SIZE][TILE_SIZE];
+    threadgroup half B_tile[TILE_SIZE][TILE_SIZE];
+
+    uint b = group_id.z;
+    uint col = group_id.x * TILE_SIZE + tid.x;
+    uint row = group_id.y * TILE_SIZE + tid.y;
+
+    // Batch offsets
+    uint q_batch_offset = b * M * K_dim;
+    uint k_batch_offset = b * N * K_dim;
+    uint out_batch_offset = b * M * N;
+
+    float sum = 0.0f;
+    uint numTiles = (K_dim + TILE_SIZE - 1) / TILE_SIZE;
+
+    for (uint t = 0; t < numTiles; t++) {
+        uint tiledK = t * TILE_SIZE + tid.x;
+        // Load Q tile: Q[b, row, tiledK]
+        if (row < (uint)M && tiledK < (uint)K_dim) {
+            A_tile[tid.y][tid.x] = Q[q_batch_offset + row * K_dim + tiledK];
+        } else {
+            A_tile[tid.y][tid.x] = 0.0h;
+        }
+
+        uint tiledK_row = t * TILE_SIZE + tid.y;
+        // Load K tile transposed: K[b, col, tiledK_row] -> access K^T
+        if (col < (uint)N && tiledK_row < (uint)K_dim) {
+            B_tile[tid.y][tid.x] = K[k_batch_offset + col * K_dim + tiledK_row];
+        } else {
+            B_tile[tid.y][tid.x] = 0.0h;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Compute partial dot product with f32 accumulation
+        for (uint k = 0; k < TILE_SIZE; k++) {
+            sum += float(A_tile[tid.y][k]) * float(B_tile[k][tid.x]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Write result with scale
+    if (row < (uint)M && col < (uint)N) {
+        out[out_batch_offset + row * N + col] = half(sum * scale);
+    }
+}
+
+/* Batched matmul for scores @ V (no transpose)
+ * scores: [batch, M, K] (half) - K is seq_k
+ * V: [batch, K, N] (half)
+ * out: [batch, M, N] (half)
+ * For attention: M=seq_q, K=seq_k, N=head_dim
+ */
+kernel void batched_matmul_half_sv(
+    device const half *scores [[buffer(0)]],
+    device const half *V [[buffer(1)]],
+    device half *out [[buffer(2)]],
+    constant int &M [[buffer(3)]],      // seq_q
+    constant int &K_dim [[buffer(4)]],  // seq_k
+    constant int &N [[buffer(5)]],      // head_dim
+    constant int &batch [[buffer(6)]],  // num_heads
+    uint3 tid [[thread_position_in_threadgroup]],
+    uint3 group_id [[threadgroup_position_in_grid]]
+) {
+    threadgroup half A_tile[TILE_SIZE][TILE_SIZE];
+    threadgroup half B_tile[TILE_SIZE][TILE_SIZE];
+
+    uint b = group_id.z;
+    uint col = group_id.x * TILE_SIZE + tid.x;
+    uint row = group_id.y * TILE_SIZE + tid.y;
+
+    // Batch offsets
+    uint scores_batch_offset = b * M * K_dim;
+    uint v_batch_offset = b * K_dim * N;
+    uint out_batch_offset = b * M * N;
+
+    float sum = 0.0f;
+    uint numTiles = (K_dim + TILE_SIZE - 1) / TILE_SIZE;
+
+    for (uint t = 0; t < numTiles; t++) {
+        uint tiledK = t * TILE_SIZE + tid.x;
+        // Load scores tile: scores[b, row, tiledK]
+        if (row < (uint)M && tiledK < (uint)K_dim) {
+            A_tile[tid.y][tid.x] = scores[scores_batch_offset + row * K_dim + tiledK];
+        } else {
+            A_tile[tid.y][tid.x] = 0.0h;
+        }
+
+        uint tiledK_row = t * TILE_SIZE + tid.y;
+        // Load V tile: V[b, tiledK_row, col]
+        if (tiledK_row < (uint)K_dim && col < (uint)N) {
+            B_tile[tid.y][tid.x] = V[v_batch_offset + tiledK_row * N + col];
+        } else {
+            B_tile[tid.y][tid.x] = 0.0h;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Compute partial dot product with f32 accumulation
+        for (uint k = 0; k < TILE_SIZE; k++) {
+            sum += float(A_tile[tid.y][k]) * float(B_tile[k][tid.x]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Write result
+    if (row < (uint)M && col < (uint)N) {
+        out[out_batch_offset + row * N + col] = half(sum);
+    }
+}
+
+/* Softmax for half-precision attention scores
+ * scores: [batch, M, N] (half)
+ * Applies row-wise softmax in-place
+ */
+kernel void softmax_half(
+    device half *scores [[buffer(0)]],
+    constant int &total_rows [[buffer(1)]],
+    constant int &N [[buffer(2)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]]
+) {
+    if (row >= (uint)total_rows) return;
+
+    device half *row_data = scores + row * N;
+    threadgroup float shared_max[256];
+    threadgroup float shared_sum[256];
+
+    // Find max (for numerical stability)
+    float local_max = -INFINITY;
+    for (int i = tid; i < N; i += threads) {
+        local_max = max(local_max, float(row_data[i]));
+    }
+    shared_max[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Reduce to find global max
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_max[tid] = max(shared_max[tid], shared_max[tid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float max_val = shared_max[0];
+
+    // Compute exp(x - max) and sum
+    float local_sum = 0.0f;
+    for (int i = tid; i < N; i += threads) {
+        float exp_val = exp(float(row_data[i]) - max_val);
+        row_data[i] = half(exp_val);  // Store temporarily
+        local_sum += exp_val;
+    }
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Reduce sum
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float sum = shared_sum[0];
+    float inv_sum = 1.0f / sum;
+
+    // Normalize
+    for (int i = tid; i < N; i += threads) {
+        row_data[i] = half(float(row_data[i]) * inv_sum);
+    }
+}
+
+/* ========================================================================
+ * BFloat16 Native Kernels
+ * These kernels accept bf16 inputs and produce bf16 outputs with f32
+ * internal computation for numerical stability.
+ * ======================================================================== */
+
+/* Helper: bf16 <-> f32 conversion functions */
+inline float bf16_to_f32(ushort bf16) {
+    uint bits = uint(bf16) << 16;
+    return as_type<float>(bits);
+}
+
+inline ushort f32_to_bf16(float f32) {
+    uint bits = as_type<uint>(f32);
+    // Round to nearest even
+    uint lsb = (bits >> 16) & 1;
+    uint rounding = 0x7FFF + lsb;
+    bits += rounding;
+    return ushort(bits >> 16);
+}
+
+/* RMSNorm for bf16: out = x * rsqrt(mean(x^2) + eps) * weight
+ * x: [seq, hidden] (bf16), weight: [hidden] (bf16), out: [seq, hidden] (bf16)
+ */
+kernel void rms_norm_bf16(
+    device const ushort *x [[buffer(0)]],
+    device const ushort *weight [[buffer(1)]],
+    device ushort *out [[buffer(2)]],
+    constant int &hidden [[buffer(3)]],
+    constant float &eps [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]]
+) {
+    threadgroup float shared_sum[256];
+
+    device const ushort *x_row = x + row * hidden;
+    device ushort *out_row = out + row * hidden;
+
+    // Compute partial sum of squares in f32
+    float local_sum = 0.0f;
+    for (int i = tid; i < hidden; i += threads) {
+        float val = bf16_to_f32(x_row[i]);
+        local_sum += val * val;
+    }
+    shared_sum[tid] = local_sum;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Parallel reduction
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float rms_inv = rsqrt(shared_sum[0] / float(hidden) + eps);
+
+    // Apply normalization with weight, output bf16
+    for (int i = tid; i < hidden; i += threads) {
+        float val = bf16_to_f32(x_row[i]);
+        float w = bf16_to_f32(weight[i]);
+        out_row[i] = f32_to_bf16(val * rms_inv * w);
+    }
+}
+
+/* QK RMSNorm for bf16 - processes Q and K heads in bf16 */
+kernel void qk_rms_norm_bf16(
+    device ushort *q [[buffer(0)]],
+    device ushort *k [[buffer(1)]],
+    device const ushort *q_weight [[buffer(2)]],
+    device const ushort *k_weight [[buffer(3)]],
+    constant int &heads [[buffer(4)]],
+    constant int &head_dim [[buffer(5)]],
+    constant float &eps [[buffer(6)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint seq_idx = pos.x;
+    uint head_idx = pos.y;
+
+    uint hidden = heads * head_dim;
+    uint offset = seq_idx * hidden + head_idx * head_dim;
+
+    // RMSNorm for Q
+    float sum_sq = 0.0f;
+    for (int d = 0; d < head_dim; d++) {
+        float val = bf16_to_f32(q[offset + d]);
+        sum_sq += val * val;
+    }
+    float rms_inv = rsqrt(sum_sq / float(head_dim) + eps);
+    for (int d = 0; d < head_dim; d++) {
+        float val = bf16_to_f32(q[offset + d]);
+        float w = bf16_to_f32(q_weight[d]);
+        q[offset + d] = f32_to_bf16(val * rms_inv * w);
+    }
+
+    // RMSNorm for K
+    sum_sq = 0.0f;
+    for (int d = 0; d < head_dim; d++) {
+        float val = bf16_to_f32(k[offset + d]);
+        sum_sq += val * val;
+    }
+    rms_inv = rsqrt(sum_sq / float(head_dim) + eps);
+    for (int d = 0; d < head_dim; d++) {
+        float val = bf16_to_f32(k[offset + d]);
+        float w = bf16_to_f32(k_weight[d]);
+        k[offset + d] = f32_to_bf16(val * rms_inv * w);
+    }
+}
+
+/* LayerNorm + AdaLN for bf16
+ * out = (1 + scale) * norm(x) + shift
+ */
+kernel void adaln_norm_bf16(
+    device const ushort *x [[buffer(0)]],
+    device const ushort *shift [[buffer(1)]],
+    device const ushort *scale [[buffer(2)]],
+    device ushort *out [[buffer(3)]],
+    constant int &hidden [[buffer(4)]],
+    constant float &eps [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]]
+) {
+    threadgroup float shared_sum[256];
+    threadgroup float shared_sum_sq[256];
+
+    device const ushort *x_row = x + row * hidden;
+    device ushort *out_row = out + row * hidden;
+
+    float local_sum = 0.0f;
+    float local_sum_sq = 0.0f;
+    for (int i = tid; i < hidden; i += threads) {
+        float val = bf16_to_f32(x_row[i]);
+        local_sum += val;
+        local_sum_sq += val * val;
+    }
+    shared_sum[tid] = local_sum;
+    shared_sum_sq[tid] = local_sum_sq;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+            shared_sum_sq[tid] += shared_sum_sq[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float mean = shared_sum[0] / float(hidden);
+    float var = shared_sum_sq[0] / float(hidden) - mean * mean;
+    float std_inv = rsqrt(var + eps);
+
+    for (int i = tid; i < hidden; i += threads) {
+        float val = bf16_to_f32(x_row[i]);
+        float s = bf16_to_f32(scale[i]);
+        float sh = bf16_to_f32(shift[i]);
+        float norm = (val - mean) * std_inv;
+        out_row[i] = f32_to_bf16((1.0f + s) * norm + sh);
+    }
+}
+
+/* SiLU for bf16: x * sigmoid(x) */
+kernel void silu_bf16(
+    device ushort *x [[buffer(0)]],
+    constant int &n [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid < uint(n)) {
+        float val = bf16_to_f32(x[gid]);
+        x[gid] = f32_to_bf16(val / (1.0f + exp(-val)));
+    }
+}
+
+/* SiLU with multiply for bf16: gate = silu(gate) * up */
+kernel void silu_mul_bf16(
+    device ushort *gate [[buffer(0)]],
+    device const ushort *up [[buffer(1)]],
+    constant int &n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid < uint(n)) {
+        float g = bf16_to_f32(gate[gid]);
+        float silu_g = g / (1.0f + exp(-g));
+        float u = bf16_to_f32(up[gid]);
+        gate[gid] = f32_to_bf16(silu_g * u);
+    }
+}
+
+/* Gated add for bf16: out += gate * proj */
+kernel void gated_add_bf16(
+    device ushort *out [[buffer(0)]],
+    device const ushort *gate [[buffer(1)]],
+    device const ushort *proj [[buffer(2)]],
+    constant int &seq [[buffer(3)]],
+    constant int &hidden [[buffer(4)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint s = pos.x;
+    uint h = pos.y;
+    if (s < uint(seq) && h < uint(hidden)) {
+        uint idx = s * hidden + h;
+        float o = bf16_to_f32(out[idx]);
+        float g = bf16_to_f32(gate[h]);
+        float p = bf16_to_f32(proj[idx]);
+        out[idx] = f32_to_bf16(o + g * p);
+    }
+}
+
+/* RoPE for bf16: applies rotary position embeddings */
+kernel void apply_rope_unified_bf16(
+    device ushort *x [[buffer(0)]],
+    device const float *txt_cos [[buffer(1)]],
+    device const float *txt_sin [[buffer(2)]],
+    device const float *img_cos [[buffer(3)]],
+    device const float *img_sin [[buffer(4)]],
+    constant int &seq [[buffer(5)]],
+    constant int &img_offset [[buffer(6)]],
+    constant int &heads [[buffer(7)]],
+    constant int &head_dim [[buffer(8)]],
+    constant int &axis_dim [[buffer(9)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint seq_idx = pos.x;
+    uint head_idx = pos.y;
+
+    if (seq_idx >= uint(seq) || head_idx >= uint(heads)) return;
+
+    uint hidden = heads * head_dim;
+    device ushort *vec = x + seq_idx * hidden + head_idx * head_dim;
+
+    device const float *cos_row;
+    device const float *sin_row;
+
+    if (seq_idx < uint(img_offset)) {
+        cos_row = txt_cos + seq_idx * head_dim;
+        sin_row = txt_sin + seq_idx * head_dim;
+    } else {
+        uint img_idx = seq_idx - uint(img_offset);
+        cos_row = img_cos + img_idx * head_dim;
+        sin_row = img_sin + img_idx * head_dim;
+    }
+
+    for (int d = 0; d < head_dim; d += 2) {
+        float c = cos_row[d];
+        float s = sin_row[d];
+
+        float x0 = bf16_to_f32(vec[d]);
+        float x1 = bf16_to_f32(vec[d + 1]);
+
+        vec[d] = f32_to_bf16(x0 * c - x1 * s);
+        vec[d + 1] = f32_to_bf16(x1 * c + x0 * s);
+    }
+}
+
+/* Batched matmul Q @ K^T for bf16 with f32 accumulation */
+kernel void batched_matmul_bf16_qkt(
+    device const ushort *Q [[buffer(0)]],
+    device const ushort *K [[buffer(1)]],
+    device ushort *out [[buffer(2)]],
+    constant int &M [[buffer(3)]],      // seq_q
+    constant int &N [[buffer(4)]],      // seq_k
+    constant int &K_dim [[buffer(5)]],  // head_dim
+    constant int &batch [[buffer(6)]],  // num_heads
+    constant float &scale [[buffer(7)]],
+    uint3 tid [[thread_position_in_threadgroup]],
+    uint3 group_id [[threadgroup_position_in_grid]]
+) {
+    threadgroup float A_tile[TILE_SIZE][TILE_SIZE];
+    threadgroup float B_tile[TILE_SIZE][TILE_SIZE];
+
+    uint b = group_id.z;
+    uint col = group_id.x * TILE_SIZE + tid.x;
+    uint row = group_id.y * TILE_SIZE + tid.y;
+
+    uint q_batch_offset = b * M * K_dim;
+    uint k_batch_offset = b * N * K_dim;
+    uint out_batch_offset = b * M * N;
+
+    float sum = 0.0f;
+    uint numTiles = (K_dim + TILE_SIZE - 1) / TILE_SIZE;
+
+    for (uint t = 0; t < numTiles; t++) {
+        uint tiledK = t * TILE_SIZE + tid.x;
+        if (row < (uint)M && tiledK < (uint)K_dim) {
+            A_tile[tid.y][tid.x] = bf16_to_f32(Q[q_batch_offset + row * K_dim + tiledK]);
+        } else {
+            A_tile[tid.y][tid.x] = 0.0f;
+        }
+
+        uint tiledK_row = t * TILE_SIZE + tid.y;
+        if (col < (uint)N && tiledK_row < (uint)K_dim) {
+            B_tile[tid.y][tid.x] = bf16_to_f32(K[k_batch_offset + col * K_dim + tiledK_row]);
+        } else {
+            B_tile[tid.y][tid.x] = 0.0f;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint k = 0; k < TILE_SIZE; k++) {
+            sum += A_tile[tid.y][k] * B_tile[k][tid.x];
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (row < (uint)M && col < (uint)N) {
+        out[out_batch_offset + row * N + col] = f32_to_bf16(sum * scale);
+    }
+}
+
+/* Batched matmul scores @ V for bf16 with f32 accumulation */
+kernel void batched_matmul_bf16_sv(
+    device const ushort *scores [[buffer(0)]],
+    device const ushort *V [[buffer(1)]],
+    device ushort *out [[buffer(2)]],
+    constant int &M [[buffer(3)]],      // seq_q
+    constant int &K_dim [[buffer(4)]],  // seq_k
+    constant int &N [[buffer(5)]],      // head_dim
+    constant int &batch [[buffer(6)]],  // num_heads
+    uint3 tid [[thread_position_in_threadgroup]],
+    uint3 group_id [[threadgroup_position_in_grid]]
+) {
+    threadgroup float A_tile[TILE_SIZE][TILE_SIZE];
+    threadgroup float B_tile[TILE_SIZE][TILE_SIZE];
+
+    uint b = group_id.z;
+    uint col = group_id.x * TILE_SIZE + tid.x;
+    uint row = group_id.y * TILE_SIZE + tid.y;
+
+    uint scores_batch_offset = b * M * K_dim;
+    uint v_batch_offset = b * K_dim * N;
+    uint out_batch_offset = b * M * N;
+
+    float sum = 0.0f;
+    uint numTiles = (K_dim + TILE_SIZE - 1) / TILE_SIZE;
+
+    for (uint t = 0; t < numTiles; t++) {
+        uint tiledK = t * TILE_SIZE + tid.x;
+        if (row < (uint)M && tiledK < (uint)K_dim) {
+            A_tile[tid.y][tid.x] = bf16_to_f32(scores[scores_batch_offset + row * K_dim + tiledK]);
+        } else {
+            A_tile[tid.y][tid.x] = 0.0f;
+        }
+
+        uint tiledK_row = t * TILE_SIZE + tid.y;
+        if (tiledK_row < (uint)K_dim && col < (uint)N) {
+            B_tile[tid.y][tid.x] = bf16_to_f32(V[v_batch_offset + tiledK_row * N + col]);
+        } else {
+            B_tile[tid.y][tid.x] = 0.0f;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint k = 0; k < TILE_SIZE; k++) {
+            sum += A_tile[tid.y][k] * B_tile[k][tid.x];
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (row < (uint)M && col < (uint)N) {
+        out[out_batch_offset + row * N + col] = f32_to_bf16(sum);
+    }
+}
+
+/* Softmax for bf16 attention scores (f32 internal computation) */
+kernel void softmax_bf16(
+    device ushort *scores [[buffer(0)]],
+    constant int &total_rows [[buffer(1)]],
+    constant int &N [[buffer(2)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint threads [[threads_per_threadgroup]]
+) {
+    if (row >= (uint)total_rows) return;
+
+    device ushort *row_data = scores + row * N;
+    threadgroup float shared_max[256];
+    threadgroup float shared_sum[256];
+
+    // Find max in f32
+    float local_max = -INFINITY;
+    for (int i = tid; i < N; i += threads) {
+        local_max = max(local_max, bf16_to_f32(row_data[i]));
+    }
+    shared_max[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_max[tid] = max(shared_max[tid], shared_max[tid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float max_val = shared_max[0];
+
+    // Compute exp and sum in f32
+    float local_sum = 0.0f;
+    for (int i = tid; i < N; i += threads) {
+        float exp_val = exp(bf16_to_f32(row_data[i]) - max_val);
+        row_data[i] = f32_to_bf16(exp_val);
+        local_sum += exp_val;
+    }
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_sum = 1.0f / shared_sum[0];
+
+    // Normalize and store as bf16
+    for (int i = tid; i < N; i += threads) {
+        row_data[i] = f32_to_bf16(bf16_to_f32(row_data[i]) * inv_sum);
+    }
+}
+
+/* Convert f32 tensor to bf16 */
+kernel void f32_to_bf16_convert(
+    device const float *input [[buffer(0)]],
+    device ushort *output [[buffer(1)]],
+    constant int &n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid < uint(n)) {
+        output[gid] = f32_to_bf16(input[gid]);
+    }
+}
+
+/* Convert bf16 tensor to f32 */
+kernel void bf16_to_f32_convert(
+    device const ushort *input [[buffer(0)]],
+    device float *output [[buffer(1)]],
+    constant int &n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid < uint(n)) {
+        output[gid] = bf16_to_f32(input[gid]);
+    }
+}
+
+/* Batched bf16 linear: out = x @ W^T where W is bf16 weights
+ * x: [batch, in_features] (bf16)
+ * W: [out_features, in_features] (bf16)
+ * out: [batch, out_features] (bf16)
+ * Uses f32 accumulation for numerical stability
+ */
+kernel void linear_bf16(
+    device const ushort *x [[buffer(0)]],
+    device const ushort *W [[buffer(1)]],
+    device ushort *out [[buffer(2)]],
+    constant int &batch [[buffer(3)]],
+    constant int &in_features [[buffer(4)]],
+    constant int &out_features [[buffer(5)]],
+    uint3 tid [[thread_position_in_threadgroup]],
+    uint3 group_id [[threadgroup_position_in_grid]]
+) {
+    threadgroup float A_tile[TILE_SIZE][TILE_SIZE];
+    threadgroup float B_tile[TILE_SIZE][TILE_SIZE];
+
+    uint row = group_id.y * TILE_SIZE + tid.y;  // batch index
+    uint col = group_id.x * TILE_SIZE + tid.x;  // output feature
+
+    float sum = 0.0f;
+    uint numTiles = (in_features + TILE_SIZE - 1) / TILE_SIZE;
+
+    for (uint t = 0; t < numTiles; t++) {
+        uint tiledK = t * TILE_SIZE + tid.x;
+        // Load x[row, tiledK]
+        if (row < (uint)batch && tiledK < (uint)in_features) {
+            A_tile[tid.y][tid.x] = bf16_to_f32(x[row * in_features + tiledK]);
+        } else {
+            A_tile[tid.y][tid.x] = 0.0f;
+        }
+
+        uint tiledK_row = t * TILE_SIZE + tid.y;
+        // Load W[col, tiledK_row] (transposed access)
+        if (col < (uint)out_features && tiledK_row < (uint)in_features) {
+            B_tile[tid.y][tid.x] = bf16_to_f32(W[col * in_features + tiledK_row]);
+        } else {
+            B_tile[tid.y][tid.x] = 0.0f;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint k = 0; k < TILE_SIZE; k++) {
+            sum += A_tile[tid.y][k] * B_tile[k][tid.x];
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (row < (uint)batch && col < (uint)out_features) {
+        out[row * out_features + col] = f32_to_bf16(sum);
+    }
+}
+
+/* Split fused QKV+MLP output into separate tensors (bf16 version)
+ * fused: [seq, hidden*3 + mlp_hidden*2] (bf16)
+ * q, k, v: [seq, hidden] (bf16)
+ * gate, up: [seq, mlp_hidden] (bf16)
+ */
+kernel void split_qkv_mlp_bf16(
+    device const ushort *fused [[buffer(0)]],
+    device ushort *q [[buffer(1)]],
+    device ushort *k [[buffer(2)]],
+    device ushort *v [[buffer(3)]],
+    device ushort *gate [[buffer(4)]],
+    device ushort *up [[buffer(5)]],
+    constant int &seq [[buffer(6)]],
+    constant int &hidden [[buffer(7)]],
+    constant int &mlp_hidden [[buffer(8)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint s = pos.x;
+    uint e = pos.y;
+
+    if (s >= uint(seq)) return;
+
+    int fused_dim = hidden * 3 + mlp_hidden * 2;
+    device const ushort *row = fused + s * fused_dim;
+
+    if (e < uint(hidden)) {
+        q[s * hidden + e] = row[e];
+        k[s * hidden + e] = row[hidden + e];
+        v[s * hidden + e] = row[hidden * 2 + e];
+    }
+
+    if (e < uint(mlp_hidden)) {
+        gate[s * mlp_hidden + e] = row[hidden * 3 + e];
+        up[s * mlp_hidden + e] = row[hidden * 3 + mlp_hidden + e];
+    }
+}
+
+/* Concat attention + MLP outputs (bf16 version)
+ * attn: [seq, hidden] (bf16)
+ * mlp: [seq, mlp_hidden] (bf16)
+ * out: [seq, hidden + mlp_hidden] (bf16)
+ */
+kernel void concat_attn_mlp_bf16(
+    device const ushort *attn [[buffer(0)]],
+    device const ushort *mlp [[buffer(1)]],
+    device ushort *out [[buffer(2)]],
+    constant int &seq [[buffer(3)]],
+    constant int &hidden [[buffer(4)]],
+    constant int &mlp_hidden [[buffer(5)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint s = pos.x;
+    uint e = pos.y;
+
+    if (s >= uint(seq)) return;
+
+    int out_dim = hidden + mlp_hidden;
+    device ushort *out_row = out + s * out_dim;
+
+    if (e < uint(hidden)) {
+        out_row[e] = attn[s * hidden + e];
+    }
+
+    if (e < uint(mlp_hidden)) {
+        out_row[hidden + e] = mlp[s * mlp_hidden + e];
+    }
+}
+
+/* Concatenate two bf16 sequences along seq dimension:
+ * out = [a; b], where a: [seq_a, hidden], b: [seq_b, hidden]
+ */
+kernel void concat_seq_bf16(
+    device const ushort *a [[buffer(0)]],
+    device const ushort *b [[buffer(1)]],
+    device ushort *out [[buffer(2)]],
+    constant int &seq_a [[buffer(3)]],
+    constant int &seq_b [[buffer(4)]],
+    constant int &hidden [[buffer(5)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint s = pos.x;
+    uint h = pos.y;
+    uint total_seq = uint(seq_a + seq_b);
+
+    if (s >= total_seq || h >= uint(hidden)) return;
+
+    if (s < uint(seq_a)) {
+        out[s * hidden + h] = a[s * hidden + h];
+    } else {
+        uint b_idx = s - uint(seq_a);
+        out[s * hidden + h] = b[b_idx * hidden + h];
+    }
+}
+
+/* Slice a bf16 sequence along seq dimension:
+ * out[s, h] = in[(s + start), h], out: [seq_out, hidden]
+ */
+kernel void slice_seq_bf16(
+    device const ushort *in [[buffer(0)]],
+    device ushort *out [[buffer(1)]],
+    constant int &seq_out [[buffer(2)]],
+    constant int &hidden [[buffer(3)]],
+    constant int &start [[buffer(4)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint s = pos.x;
+    uint h = pos.y;
+
+    if (s >= uint(seq_out) || h >= uint(hidden)) return;
+
+    out[s * hidden + h] = in[(s + uint(start)) * hidden + h];
+}
+
+/* ========================================================================
+ * BF16 Transpose kernels for attention
+ * ======================================================================== */
+
+/* Transpose for attention input: [seq, heads*head_dim] -> [heads, seq, head_dim]
+ * in:  [seq, heads * head_dim] (bf16)
+ * out: [heads, seq, head_dim] (bf16)
+ */
+kernel void transpose_to_heads_bf16(
+    device const ushort *in [[buffer(0)]],
+    device ushort *out [[buffer(1)]],
+    constant int &seq [[buffer(2)]],
+    constant int &heads [[buffer(3)]],
+    constant int &head_dim [[buffer(4)]],
+    uint3 pos [[thread_position_in_grid]]
+) {
+    uint h = pos.z;      // head index
+    uint s = pos.y;      // sequence position
+    uint d = pos.x;      // head_dim position
+
+    if (h >= uint(heads) || s >= uint(seq) || d >= uint(head_dim)) return;
+
+    // Input layout: [seq, heads * head_dim] - row s, column h*head_dim + d
+    uint in_idx = s * (heads * head_dim) + h * head_dim + d;
+
+    // Output layout: [heads, seq, head_dim] - head h, row s, column d
+    uint out_idx = h * (seq * head_dim) + s * head_dim + d;
+
+    out[out_idx] = in[in_idx];
+}
+
+/* Transpose for attention output: [heads, seq, head_dim] -> [seq, heads*head_dim]
+ * in:  [heads, seq, head_dim] (bf16)
+ * out: [seq, heads * head_dim] (bf16)
+ */
+kernel void transpose_from_heads_bf16(
+    device const ushort *in [[buffer(0)]],
+    device ushort *out [[buffer(1)]],
+    constant int &seq [[buffer(2)]],
+    constant int &heads [[buffer(3)]],
+    constant int &head_dim [[buffer(4)]],
+    uint3 pos [[thread_position_in_grid]]
+) {
+    uint h = pos.z;      // head index
+    uint s = pos.y;      // sequence position
+    uint d = pos.x;      // head_dim position
+
+    if (h >= uint(heads) || s >= uint(seq) || d >= uint(head_dim)) return;
+
+    // Input layout: [heads, seq, head_dim] - head h, row s, column d
+    uint in_idx = h * (seq * head_dim) + s * head_dim + d;
+
+    // Output layout: [seq, heads * head_dim] - row s, column h*head_dim + d
+    uint out_idx = s * (heads * head_dim) + h * head_dim + d;
+
+    out[out_idx] = in[in_idx];
+}
+
+/* ========================================================================
+ * Fused Non-Causal Attention for BF16 Pipeline
+ * Same algorithm as attention_fused but with bf16 I/O and f32 computation.
+ *
+ * This kernel computes one output row per threadgroup:
+ * out[query_idx, head] = softmax(Q @ K^T * scale) @ V
+ *
+ * Works directly on [seq, heads*head_dim] layout without transpose.
+ * bf16 input/output, f32 accumulation for numerical stability.
+ * ======================================================================== */
+
+kernel void attention_fused_bf16(
+    device const ushort *Q [[buffer(0)]],      // [seq_q, heads * head_dim] bf16
+    device const ushort *K [[buffer(1)]],      // [seq_k, heads * head_dim] bf16
+    device const ushort *V [[buffer(2)]],      // [seq_k, heads * head_dim] bf16
+    device ushort *out [[buffer(3)]],          // [seq_q, heads * head_dim] bf16
+    constant int &seq_q [[buffer(4)]],         // Query sequence length
+    constant int &seq_k [[buffer(5)]],         // Key/Value sequence length
+    constant int &num_heads [[buffer(6)]],
+    constant int &head_dim [[buffer(7)]],
+    constant float &scale [[buffer(8)]],
+    uint3 tg_pos [[threadgroup_position_in_grid]],   // (query_idx, head_idx, 0)
+    uint3 tid_pos [[thread_position_in_threadgroup]],
+    uint3 tg_size [[threads_per_threadgroup]]
+) {
+    // Shared memory for scores and reductions
+    threadgroup float shared_scores[1024];  // Up to 1024 seq_k (768 for 256x256)
+    threadgroup float shared_max[256];
+    threadgroup float shared_sum[256];
+
+    int query_idx = tg_pos.x;
+    int head_idx = tg_pos.y;
+    uint tid = tid_pos.x;
+    uint threads = tg_size.x;
+
+    if (query_idx >= seq_q || head_idx >= num_heads) return;
+
+    int hidden = num_heads * head_dim;
+
+    // Pointers to this position's Q and output (layout: [seq, heads*head_dim])
+    device const ushort *q_row = Q + query_idx * hidden + head_idx * head_dim;
+    device ushort *out_row = out + query_idx * hidden + head_idx * head_dim;
+
+    // K and V have same layout, head offset is same
+    device const ushort *K_head = K + head_idx * head_dim;
+    device const ushort *V_head = V + head_idx * head_dim;
+
+    // Cache Q in threadgroup memory (converted to f32)
+    threadgroup float shared_q[128];  // Max head_dim = 128
+    for (int d = tid; d < head_dim; d += threads) {
+        shared_q[d] = bf16_to_f32(q_row[d]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ========== Phase 1: Compute Q @ K^T ==========
+    float local_max = -INFINITY;
+
+    for (int key_idx = tid; key_idx < seq_k; key_idx += threads) {
+        // Dot product: Q[query_idx, head] · K[key_idx, head]
+        float dot = 0.0f;
+        device const ushort *k_row = K_head + key_idx * hidden;
+        for (int d = 0; d < head_dim; d++) {
+            dot += shared_q[d] * bf16_to_f32(k_row[d]);
+        }
+        float score = dot * scale;
+        shared_scores[key_idx] = score;
+        local_max = max(local_max, score);
+    }
+
+    shared_max[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ========== Phase 2: Find global max ==========
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && tid + stride < threads) {
+            shared_max[tid] = max(shared_max[tid], shared_max[tid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float max_val = shared_max[0];
+
+    // ========== Phase 3: Compute exp(score - max) and sum ==========
+    float local_sum = 0.0f;
+    for (int key_idx = tid; key_idx < seq_k; key_idx += threads) {
+        float e = exp(shared_scores[key_idx] - max_val);
+        shared_scores[key_idx] = e;
+        local_sum += e;
+    }
+
+    shared_sum[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ========== Phase 4: Find total sum ==========
+    for (uint stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && tid + stride < threads) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_sum = 1.0f / shared_sum[0];
+
+    // ========== Phase 5: Normalize scores ==========
+    for (int key_idx = tid; key_idx < seq_k; key_idx += threads) {
+        shared_scores[key_idx] *= inv_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ========== Phase 6: Compute output = scores @ V ==========
+    for (int d = tid; d < head_dim; d += threads) {
+        float acc = 0.0f;
+        for (int key_idx = 0; key_idx < seq_k; key_idx++) {
+            float v_val = bf16_to_f32(V_head[key_idx * hidden + d]);
+            acc += shared_scores[key_idx] * v_val;
+        }
+        out_row[d] = f32_to_bf16(acc);
     }
 }

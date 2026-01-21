@@ -168,6 +168,12 @@ void flux_gpu_tensor_set_persistent(flux_gpu_tensor_t tensor, int persistent);
 void flux_gpu_tensor_read(flux_gpu_tensor_t tensor, float *out);
 
 /*
+ * Copy data from CPU to tensor.
+ * Waits for any pending GPU operations on this tensor first.
+ */
+void flux_gpu_tensor_write(flux_gpu_tensor_t tensor, const float *data);
+
+/*
  * Get direct pointer to tensor data (shared memory mode).
  * WARNING: Caller must ensure no GPU operations are pending on this tensor.
  * On Apple Silicon unified memory, this provides zero-copy access.
@@ -183,6 +189,11 @@ void flux_gpu_tensor_free(flux_gpu_tensor_t tensor);
  * Get tensor element count.
  */
 size_t flux_gpu_tensor_size(flux_gpu_tensor_t tensor);
+
+/*
+ * Check if tensor is in bf16/f16 format.
+ */
+int flux_gpu_tensor_is_f16(flux_gpu_tensor_t tensor);
 
 /* ========================================================================
  * GPU Operations on Tensors - Operations that keep data on GPU
@@ -212,6 +223,39 @@ flux_gpu_tensor_t flux_gpu_linear(flux_gpu_tensor_t x,
 flux_gpu_tensor_t flux_gpu_linear_bf16(flux_gpu_tensor_t x,
                                         const uint16_t *W_bf16,
                                         int seq_len, int in_dim, int out_dim);
+
+/*
+ * GPU linear with bf16 weights - outputs bf16 tensor for full bf16 pipeline.
+ * Uses native MPSDataTypeBFloat16.
+ */
+flux_gpu_tensor_t flux_gpu_linear_bf16_bf16out(flux_gpu_tensor_t x,
+                                               const uint16_t *W_bf16,
+                                               int seq_len, int in_dim, int out_dim);
+
+/*
+ * Allocate bf16 GPU tensor (uses half the memory of f32).
+ */
+flux_gpu_tensor_t flux_gpu_tensor_alloc_f16(size_t num_elements);
+
+/*
+ * BFloat16 MPS attention for bf16 GPU tensors.
+ * Uses native MPSDataTypeBFloat16.
+ * Q, K, V, out must all be bf16 tensors (is_f16 = 1).
+ * Returns 1 on success, 0 on failure.
+ */
+int flux_gpu_attention_mps_bf16(flux_gpu_tensor_t out,
+                                flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+                                int seq_q, int seq_k, int num_heads, int head_dim, float scale);
+
+/*
+ * BFloat16 attention with f32 tensor interface.
+ * Takes f32 GPU tensors, converts to bf16, does bf16 attention, converts back.
+ * Provides 2x memory bandwidth savings while keeping rest of pipeline in f32.
+ * Returns 1 on success, 0 on failure.
+ */
+int flux_gpu_attention_bf16(flux_gpu_tensor_t out,
+                            flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+                            int seq_q, int seq_k, int num_heads, int head_dim, float scale);
 
 /*
  * Sync all pending GPU operations.
@@ -302,6 +346,136 @@ int flux_gpu_attention_fused(flux_gpu_tensor_t out,
                              flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
                              int seq_q, int seq_k, int num_heads, int head_dim, float scale);
 
+/* Native BF16 attention on GPU tensors (all tensors must be bf16 format).
+ * Uses bf16 compute shaders with f32 accumulation for numerical stability.
+ * Returns 1 on success, 0 if tensors are not bf16 or shaders unavailable.
+ */
+int flux_gpu_attention_bf16_native(flux_gpu_tensor_t out,
+                                    flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+                                    int seq_q, int seq_k, int num_heads, int head_dim, float scale);
+
+/* Truly fused BF16 attention on GPU tensors - no intermediate score storage.
+ * Uses custom Metal kernel with bf16 I/O and f32 internal computation.
+ * Returns 1 on success, 0 if tensors are not bf16, seq_k > 1024, or shaders unavailable.
+ */
+int flux_gpu_attention_fused_bf16(flux_gpu_tensor_t out,
+                                   flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+                                   int seq_q, int seq_k, int num_heads, int head_dim, float scale);
+
+/* ========================================================================
+ * BF16 GPU Tensor Operations
+ * All operations work on bf16 tensors (is_f16 = 1) with f32 internal computation.
+ * ======================================================================== */
+
+/* BF16 AdaLN normalization */
+void flux_gpu_adaln_norm_bf16(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
+                               flux_gpu_tensor_t shift_bf16, flux_gpu_tensor_t scale_bf16,
+                               int seq, int hidden, float eps);
+
+/* BF16 QK RMSNorm (in-place) */
+void flux_gpu_qk_rms_norm_bf16(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
+                                flux_gpu_tensor_t q_weight_bf16, flux_gpu_tensor_t k_weight_bf16,
+                                int seq, int heads, int head_dim, float eps);
+
+/* BF16 SiLU multiply: gate = silu(gate) * up */
+void flux_gpu_silu_mul_bf16(flux_gpu_tensor_t gate, flux_gpu_tensor_t up, int n);
+
+/* BF16 Gated add: out += gate * proj */
+void flux_gpu_gated_add_bf16(flux_gpu_tensor_t out, flux_gpu_tensor_t gate_bf16,
+                              flux_gpu_tensor_t proj, int seq, int hidden);
+
+/* BF16 RoPE unified (text + image) */
+void flux_gpu_rope_unified_bf16(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
+                                 const float *txt_cos, const float *txt_sin,
+                                 const float *img_cos, const float *img_sin,
+                                 int seq, int img_offset, int heads, int head_dim, int axis_dim);
+
+/* BF16 RoPE 2D (single stream) */
+void flux_gpu_rope_2d_bf16(flux_gpu_tensor_t x,
+                            const float *cos_freq, const float *sin_freq,
+                            int seq, int heads, int head_dim, int axis_dim);
+
+/* Concatenate two bf16 sequences along seq dimension */
+void flux_gpu_concat_seq_bf16(flux_gpu_tensor_t out,
+                               flux_gpu_tensor_t a, flux_gpu_tensor_t b,
+                               int seq_a, int seq_b, int hidden);
+
+/* Slice a bf16 sequence along seq dimension */
+void flux_gpu_slice_seq_bf16(flux_gpu_tensor_t out,
+                              flux_gpu_tensor_t in,
+                              int seq_out, int hidden, int start);
+
+/* BF16 Split QKV+MLP output */
+void flux_gpu_split_qkv_mlp_bf16(flux_gpu_tensor_t fused,
+                                  flux_gpu_tensor_t q, flux_gpu_tensor_t k, flux_gpu_tensor_t v,
+                                  flux_gpu_tensor_t gate, flux_gpu_tensor_t up,
+                                  int seq, int hidden, int mlp_hidden);
+
+/* BF16 Concat attention + MLP outputs */
+void flux_gpu_concat_attn_mlp_bf16(flux_gpu_tensor_t attn, flux_gpu_tensor_t mlp,
+                                    flux_gpu_tensor_t out, int seq, int hidden, int mlp_hidden);
+
+/* Convert f32 GPU tensor to bf16 (returns new tensor) */
+flux_gpu_tensor_t flux_gpu_tensor_f32_to_bf16(flux_gpu_tensor_t f32_tensor);
+
+/* Convert bf16 GPU tensor to f32 (returns new tensor) */
+flux_gpu_tensor_t flux_gpu_tensor_bf16_to_f32(flux_gpu_tensor_t bf16_tensor);
+
+/* BF16 native linear layer (all bf16) */
+flux_gpu_tensor_t flux_gpu_linear_bf16_native(flux_gpu_tensor_t x,
+                                               const uint16_t *W_bf16,
+                                               int seq_len, int in_dim, int out_dim);
+
+/* BF16 AdaLN normalization */
+void flux_gpu_adaln_norm_bf16(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
+                               flux_gpu_tensor_t shift_bf16, flux_gpu_tensor_t scale_bf16,
+                               int seq, int hidden, float eps);
+
+/* BF16 QK RMSNorm (in-place) */
+void flux_gpu_qk_rms_norm_bf16(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
+                                flux_gpu_tensor_t q_weight_bf16, flux_gpu_tensor_t k_weight_bf16,
+                                int seq, int heads, int head_dim, float eps);
+
+/* BF16 SiLU multiply: gate = silu(gate) * up */
+void flux_gpu_silu_mul_bf16(flux_gpu_tensor_t gate, flux_gpu_tensor_t up, int n);
+
+/* BF16 Gated add: out += gate * proj */
+void flux_gpu_gated_add_bf16(flux_gpu_tensor_t out, flux_gpu_tensor_t gate_bf16,
+                              flux_gpu_tensor_t proj, int seq, int hidden);
+
+/* BF16 RoPE (frequencies are f32 on CPU) */
+void flux_gpu_rope_unified_bf16(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
+                                 const float *txt_cos, const float *txt_sin,
+                                 const float *img_cos, const float *img_sin,
+                                 int seq, int img_offset, int heads, int head_dim, int axis_dim);
+
+/* BF16 Split fused QKV+MLP output */
+void flux_gpu_split_qkv_mlp_bf16(flux_gpu_tensor_t fused,
+                                  flux_gpu_tensor_t q, flux_gpu_tensor_t k, flux_gpu_tensor_t v,
+                                  flux_gpu_tensor_t gate, flux_gpu_tensor_t up,
+                                  int seq, int hidden, int mlp_hidden);
+
+/* BF16 Concat attention + MLP outputs */
+void flux_gpu_concat_attn_mlp_bf16(flux_gpu_tensor_t attn, flux_gpu_tensor_t mlp,
+                                    flux_gpu_tensor_t out, int seq, int hidden, int mlp_hidden);
+
+/* BF16 Transpose for attention: [seq, heads*head_dim] -> [heads, seq, head_dim] */
+void flux_gpu_transpose_to_heads_bf16(flux_gpu_tensor_t in, flux_gpu_tensor_t out,
+                                       int seq, int heads, int head_dim);
+
+/* BF16 Transpose for attention output: [heads, seq, head_dim] -> [seq, heads*head_dim] */
+void flux_gpu_transpose_from_heads_bf16(flux_gpu_tensor_t in, flux_gpu_tensor_t out,
+                                         int seq, int heads, int head_dim);
+
+/* Native BF16 attention on GPU tensors (all tensors must be bf16 format).
+ * Uses bf16 compute shaders with f32 accumulation for numerical stability.
+ * Q, K, V: [heads, seq, head_dim] layout (already transposed)
+ * Returns 1 on success, 0 if tensors are not bf16 or shaders unavailable.
+ */
+int flux_gpu_attention_bf16_native(flux_gpu_tensor_t out,
+                                    flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+                                    int seq_q, int seq_k, int num_heads, int head_dim, float scale);
+
 /*
  * GPU-accelerated scaled dot-product attention.
  * Computes attention for all heads in a single GPU batch.
@@ -318,6 +492,18 @@ void flux_metal_attention(float *out,
                           float *scores_scratch,
                           int heads, int seq_q, int seq_k, int head_dim,
                           float scale);
+
+/*
+ * Half-precision version of flux_metal_attention.
+ * Same interface but uses f16 MPS matmuls internally for ~2x bandwidth savings.
+ * Takes f32 inputs, converts to f16, computes attention, converts back to f32.
+ * scores_scratch is unused (kept for interface compatibility).
+ */
+void flux_metal_attention_bf16(float *out,
+                               const float *Q, const float *K, const float *V,
+                               float *scores_scratch,
+                               int heads, int seq_q, int seq_k, int head_dim,
+                               float scale);
 
 /*
  * GPU-accelerated causal attention for text encoder (Qwen3).
@@ -422,6 +608,75 @@ void flux_metal_rope_2d(float *x, const float *cos_freq, const float *sin_freq,
  * Check if compute shaders are available.
  */
 int flux_metal_shaders_available(void);
+
+/*
+ * Pre-warm the bf16→f16 conversion cache for a weight tensor.
+ * Call this during model loading to avoid conversion overhead during inference.
+ * This converts bf16 weights to f16 and caches the result.
+ */
+void flux_metal_warmup_bf16(const uint16_t *bf16_weights, size_t num_elements);
+
+/* ========================================================================
+ * Native BF16 Pipeline API
+ *
+ * These functions work with native bf16 GPU buffers to implement a full
+ * bf16 pipeline. All operations keep data in bf16
+ * with f32 accumulation internally for numerical stability.
+ *
+ * To use this API from C code, include flux_metal.h and link with flux_metal.m
+ * The MTLBuffer pointers should be obtained from flux_gpu_tensor via
+ * flux_gpu_tensor_get_buffer() or created directly using Metal API.
+ * ======================================================================== */
+
+/*
+ * Check if bf16 pipeline is available (all required shaders loaded).
+ */
+int flux_bf16_pipeline_available(void);
+
+#ifdef __OBJC__
+#import <Metal/Metal.h>
+
+/*
+ * Native BF16 attention (no conversion overhead).
+ * All buffers contain bf16 data, f32 accumulation happens internally.
+ * Q: [heads, seq_q, head_dim] (bf16)
+ * K: [heads, seq_k, head_dim] (bf16)
+ * V: [heads, seq_k, head_dim] (bf16)
+ * out: [heads, seq_q, head_dim] (bf16)
+ */
+void flux_metal_attention_bf16_native(id<MTLBuffer> bufQ, id<MTLBuffer> bufK,
+                                       id<MTLBuffer> bufV, id<MTLBuffer> bufOut,
+                                       int heads, int seq_q, int seq_k, int head_dim,
+                                       float scale);
+
+/* Convert f32 GPU buffer to bf16 */
+void flux_bf16_convert_f32_to_bf16(id<MTLBuffer> input_f32, id<MTLBuffer> output_bf16, int n);
+
+/* Convert bf16 GPU buffer to f32 */
+void flux_bf16_convert_bf16_to_f32(id<MTLBuffer> input_bf16, id<MTLBuffer> output_f32, int n);
+
+/* RMSNorm on bf16 buffers */
+void flux_bf16_rms_norm(id<MTLBuffer> out, id<MTLBuffer> x, id<MTLBuffer> weight,
+                         int seq_len, int hidden, float eps);
+
+/* QK RMSNorm on bf16 buffers (in-place) */
+void flux_bf16_qk_rms_norm(id<MTLBuffer> q, id<MTLBuffer> k,
+                            id<MTLBuffer> q_weight, id<MTLBuffer> k_weight,
+                            int seq, int heads, int head_dim, float eps);
+
+/* SiLU on bf16 buffer (in-place) */
+void flux_bf16_silu(id<MTLBuffer> x, int n);
+
+/* SiLU with multiply on bf16 buffers: gate = silu(gate) * up */
+void flux_bf16_silu_mul(id<MTLBuffer> gate, id<MTLBuffer> up, int n);
+
+/* RoPE on bf16 buffer (frequencies are f32) */
+void flux_bf16_rope_unified(id<MTLBuffer> x,
+                             const float *txt_cos, const float *txt_sin,
+                             const float *img_cos, const float *img_sin,
+                             int seq, int img_offset, int heads, int head_dim);
+
+#endif /* __OBJC__ */
 
 #ifdef __cplusplus
 }

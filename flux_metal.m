@@ -15,13 +15,70 @@
 #import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
 #include "flux_metal.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+
+static int bf16_debug_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("FLUX_BF16_DEBUG") ? 1 : 0;
+    }
+    return enabled;
+}
+
+static int bf16_linear_use_graph(int seq_len, int in_dim, int out_dim) {
+    if (!NSClassFromString(@"MPSGraph")) return 0;
+    if (in_dim < 256 || out_dim < 256) return 0;
+    if (seq_len < 32) return 0;
+    return 1;
+}
 
 /* Global Metal state */
 static id<MTLDevice> g_device = nil;
 static id<MTLCommandQueue> g_queue = nil;
 static int g_initialized = 0;
+
+/* Cache for MPSGraph-based SDPA graphs (bf16) */
+#define MAX_SDPA_GRAPH_CACHE 8
+typedef struct {
+    int seq_q;
+    int seq_k;
+    int num_heads;
+    int head_dim;
+    __strong MPSGraph *graph;
+    __strong MPSGraphTensor *qTensor;
+    __strong MPSGraphTensor *kTensor;
+    __strong MPSGraphTensor *vTensor;
+    __strong MPSGraphTensor *outTensor;
+    __strong NSArray<NSNumber *> *qShape;
+    __strong NSArray<NSNumber *> *kShape;
+    __strong NSArray<NSNumber *> *vShape;
+    __strong NSArray<NSNumber *> *outShape;
+} sdpa_graph_cache_t;
+
+static sdpa_graph_cache_t g_sdpa_graph_cache[MAX_SDPA_GRAPH_CACHE];
+static int g_sdpa_graph_count = 0;
+static pthread_mutex_t g_sdpa_graph_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Cache for MPSGraph-based bf16 linear graphs */
+#define MAX_LINEAR_GRAPH_CACHE 32
+typedef struct {
+    int seq;
+    int in_dim;
+    int out_dim;
+    __strong MPSGraph *graph;
+    __strong MPSGraphTensor *xTensor;
+    __strong MPSGraphTensor *wTensor;
+    __strong MPSGraphTensor *outTensor;
+    __strong NSArray<NSNumber *> *xShape;
+    __strong NSArray<NSNumber *> *wShape;
+    __strong NSArray<NSNumber *> *outShape;
+} linear_graph_cache_t;
+
+static linear_graph_cache_t g_linear_graph_cache[MAX_LINEAR_GRAPH_CACHE];
+static int g_linear_graph_count = 0;
+static pthread_mutex_t g_linear_graph_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* ========================================================================
  * MPSGraph Conv2D Cache
@@ -122,6 +179,31 @@ static id<MTLBuffer> batch_get_input_buffer(const void *cpu_ptr, size_t size) {
 
 /* Forward declarations for compute shaders (defined later) */
 static id<MTLComputePipelineState> g_softmax_pipeline;
+static id<MTLComputePipelineState> g_bmm_half_qkt_pipeline;
+static id<MTLComputePipelineState> g_bmm_half_sv_pipeline;
+static id<MTLComputePipelineState> g_softmax_half_pipeline;
+/* BF16 native pipelines (forward declarations) */
+static id<MTLComputePipelineState> g_rms_norm_bf16_pipeline;
+static id<MTLComputePipelineState> g_qk_rms_norm_bf16_pipeline;
+static id<MTLComputePipelineState> g_adaln_norm_bf16_pipeline;
+static id<MTLComputePipelineState> g_silu_bf16_pipeline;
+static id<MTLComputePipelineState> g_silu_mul_bf16_pipeline;
+static id<MTLComputePipelineState> g_gated_add_bf16_pipeline;
+static id<MTLComputePipelineState> g_rope_unified_bf16_pipeline;
+static id<MTLComputePipelineState> g_rope_2d_bf16_pipeline;
+static id<MTLComputePipelineState> g_bmm_bf16_qkt_pipeline;
+static id<MTLComputePipelineState> g_bmm_bf16_sv_pipeline;
+static id<MTLComputePipelineState> g_softmax_bf16_pipeline;
+static id<MTLComputePipelineState> g_f32_to_bf16_pipeline;
+static id<MTLComputePipelineState> g_bf16_to_f32_pipeline;
+static id<MTLComputePipelineState> g_linear_bf16_pipeline;
+static id<MTLComputePipelineState> g_split_qkv_mlp_bf16_pipeline;
+static id<MTLComputePipelineState> g_concat_attn_mlp_bf16_pipeline;
+static id<MTLComputePipelineState> g_concat_seq_bf16_pipeline;
+static id<MTLComputePipelineState> g_slice_seq_bf16_pipeline;
+static id<MTLComputePipelineState> g_transpose_to_heads_bf16_pipeline;
+static id<MTLComputePipelineState> g_transpose_from_heads_bf16_pipeline;
+static id<MTLComputePipelineState> g_attention_fused_bf16_pipeline;
 static int g_shaders_initialized;
 
 /* ========================================================================
@@ -204,6 +286,23 @@ static pool_buffer_t g_activation_pool[ACTIVATION_POOL_SIZE];
 static int g_pool_count = 0;
 static pthread_mutex_t g_pool_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+static int tensor_zero_init_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("FLUX_ZERO_TENSORS") ? 1 : 0;
+    }
+    return enabled;
+}
+
+/* Forward declarations for tensor batch/chain mode checks. */
+static int tensor_batch_active(void);
+static int tensor_chain_active(void);
+
+/* Deferred pool releases to avoid buffer reuse while command buffers are in-flight. */
+#define DEFERRED_POOL_RELEASE_MAX 16384
+static id<MTLBuffer> g_deferred_pool_buffers[DEFERRED_POOL_RELEASE_MAX];
+static int g_deferred_pool_count = 0;
+
 /* Get a buffer from pool, or create new one if needed */
 static id<MTLBuffer> pool_get_buffer(size_t size) {
     pthread_mutex_lock(&g_pool_mutex);
@@ -246,8 +345,8 @@ static id<MTLBuffer> pool_get_buffer(size_t size) {
     return [g_device newBufferWithLength:size options:MTLResourceStorageModeShared];
 }
 
-/* Return buffer to pool (mark as available) */
-static void pool_release_buffer(id<MTLBuffer> buffer) {
+/* Return buffer to pool immediately (mark as available). */
+static void pool_release_buffer_immediate(id<MTLBuffer> buffer) {
     if (!buffer) return;
 
     pthread_mutex_lock(&g_pool_mutex);
@@ -260,12 +359,46 @@ static void pool_release_buffer(id<MTLBuffer> buffer) {
     pthread_mutex_unlock(&g_pool_mutex);
 }
 
+/* Return buffer to pool (mark as available) */
+static void pool_release_buffer(id<MTLBuffer> buffer) {
+    if (!buffer) return;
+
+    if (tensor_batch_active() || tensor_chain_active()) {
+        pthread_mutex_lock(&g_pool_mutex);
+        if (g_deferred_pool_count < DEFERRED_POOL_RELEASE_MAX) {
+            g_deferred_pool_buffers[g_deferred_pool_count++] = buffer;
+            pthread_mutex_unlock(&g_pool_mutex);
+            return;
+        }
+        pthread_mutex_unlock(&g_pool_mutex);
+    }
+
+    pool_release_buffer_immediate(buffer);
+}
+
 /* Release all buffers back to pool (call at end of batch) */
 static void pool_release_all(void) {
     pthread_mutex_lock(&g_pool_mutex);
     for (int i = 0; i < g_pool_count; i++) {
         g_activation_pool[i].in_use = 0;
     }
+    pthread_mutex_unlock(&g_pool_mutex);
+}
+
+/* Flush deferred pool releases after command buffer completion. */
+static void pool_flush_deferred(void) {
+    pthread_mutex_lock(&g_pool_mutex);
+    for (int i = 0; i < g_deferred_pool_count; i++) {
+        id<MTLBuffer> buffer = g_deferred_pool_buffers[i];
+        for (int j = 0; j < g_pool_count; j++) {
+            if (g_activation_pool[j].buffer == buffer) {
+                g_activation_pool[j].in_use = 0;
+                break;
+            }
+        }
+        g_deferred_pool_buffers[i] = nil;
+    }
+    g_deferred_pool_count = 0;
     pthread_mutex_unlock(&g_pool_mutex);
 }
 
@@ -278,6 +411,7 @@ static void clear_activation_pool(void) {
         g_activation_pool[i].size = 0;
     }
     g_pool_count = 0;
+    g_deferred_pool_count = 0;
     pthread_mutex_unlock(&g_pool_mutex);
 }
 
@@ -581,6 +715,38 @@ void flux_metal_sgemm(int transpose_a, int transpose_b,
     }
 }
 
+/* Convert f32 to f16 for MPS matmuls */
+static inline uint16_t f32_to_f16(float f32) {
+    uint32_t bits = *(uint32_t *)&f32;
+    uint32_t sign = (bits >> 16) & 0x8000;
+    int32_t exp = ((bits >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = (bits >> 13) & 0x3FF;
+
+    if (exp <= 0) {
+        return (uint16_t)sign;  /* Underflow to zero */
+    } else if (exp >= 31) {
+        return (uint16_t)(sign | 0x7C00);  /* Overflow to infinity */
+    }
+    return (uint16_t)(sign | (exp << 10) | mant);
+}
+
+/* Convert f16 to f32 */
+static inline float f16_to_f32(uint16_t f16) {
+    uint32_t sign = (f16 >> 15) & 0x1;
+    uint32_t exp = (f16 >> 10) & 0x1F;
+    uint32_t mant = f16 & 0x3FF;
+
+    uint32_t f32_bits;
+    if (exp == 0) {
+        f32_bits = sign << 31;  /* Zero */
+    } else if (exp == 31) {
+        f32_bits = (sign << 31) | 0x7F800000 | (mant << 13);  /* Inf/NaN */
+    } else {
+        f32_bits = (sign << 31) | ((exp - 15 + 127) << 23) | (mant << 13);
+    }
+    return *(float *)&f32_bits;
+}
+
 /* Convert bf16 to f16 for MPS compatibility
  * MPS only supports mixed precision with f16, not bf16 */
 static inline uint16_t bf16_to_f16(uint16_t bf16) {
@@ -615,7 +781,59 @@ static inline uint16_t bf16_to_f16(uint16_t bf16) {
     return (uint16_t)((sign << 15) | (new_exp << 10) | new_mant);
 }
 
-/* F16 weight cache (stores bf16 weights converted to f16 for MPS) */
+/* BF16 weight cache (stores bf16 weights directly for MPS bf16 matmul) */
+#define BF16_WEIGHT_CACHE_SIZE 512
+
+typedef struct {
+    const void *cpu_ptr;
+    id<MTLBuffer> gpu_buffer;
+    size_t size;
+} bf16_cache_entry_t;
+
+static bf16_cache_entry_t g_bf16_cache[BF16_WEIGHT_CACHE_SIZE];
+static int g_bf16_cache_count = 0;
+static pthread_mutex_t g_bf16_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Get bf16 weights buffer (no conversion - native bf16 for MPS) */
+static id<MTLBuffer> get_cached_bf16_buffer(const uint16_t *weights, size_t num_elements) {
+    pthread_mutex_lock(&g_bf16_cache_mutex);
+
+    /* Look for existing entry */
+    for (int i = 0; i < g_bf16_cache_count; i++) {
+        if (g_bf16_cache[i].cpu_ptr == weights) {
+            id<MTLBuffer> buf = g_bf16_cache[i].gpu_buffer;
+            pthread_mutex_unlock(&g_bf16_cache_mutex);
+            return buf;
+        }
+    }
+
+    size_t size = num_elements * sizeof(uint16_t);
+
+    /* Cache is full - just create buffer without caching */
+    if (g_bf16_cache_count >= BF16_WEIGHT_CACHE_SIZE) {
+        id<MTLBuffer> buf = [g_device newBufferWithBytes:weights
+                                                  length:size
+                                                 options:MTLResourceStorageModeShared];
+        pthread_mutex_unlock(&g_bf16_cache_mutex);
+        return buf;
+    }
+
+    /* Create and cache */
+    id<MTLBuffer> buf = [g_device newBufferWithBytes:weights
+                                              length:size
+                                             options:MTLResourceStorageModeShared];
+
+    g_bf16_cache[g_bf16_cache_count].cpu_ptr = weights;
+    g_bf16_cache[g_bf16_cache_count].gpu_buffer = buf;
+    g_bf16_cache[g_bf16_cache_count].size = size;
+    g_bf16_cache_count++;
+
+    pthread_mutex_unlock(&g_bf16_cache_mutex);
+    return buf;
+}
+
+/* Clear bf16 weight cache */
+/* F16 weight cache (stores bf16 weights converted to f16 for older MPS) */
 #define F16_WEIGHT_CACHE_SIZE 512
 
 typedef struct {
@@ -687,6 +905,16 @@ static id<MTLBuffer> get_cached_bf16_as_f16_buffer(const uint16_t *weights, size
 
     pthread_mutex_unlock(&g_f16_cache_mutex);
     return buf;
+}
+
+/*
+ * Pre-warm the bf16→f16 cache for a weight tensor.
+ * This triggers the conversion and caching so it doesn't happen during inference.
+ */
+void flux_metal_warmup_bf16(const uint16_t *bf16_weights, size_t num_elements) {
+    if (!g_initialized || !bf16_weights || num_elements == 0) return;
+    /* Just calling this function triggers the conversion and caching */
+    (void)get_cached_bf16_as_f16_buffer(bf16_weights, num_elements);
 }
 
 /*
@@ -1293,7 +1521,519 @@ void flux_metal_attention(float *out,
 }
 
 /* ========================================================================
- * GPU Tensor API Implementation
+ * Half-Precision Attention with Custom Metal Compute Shaders
+ *
+ * Same interface as flux_metal_attention but uses half-precision compute
+ * shaders with f32 accumulation. This provides
+ * ~2x memory bandwidth savings while maintaining numerical stability.
+ *
+ * Layout (same as flux_metal_attention):
+ * Q: [heads, seq_q, head_dim]
+ * K: [heads, seq_k, head_dim]
+ * V: [heads, seq_k, head_dim]
+ * scores_scratch: unused (kept for interface compatibility)
+ * out: [heads, seq_q, head_dim]
+ * ======================================================================== */
+void flux_metal_attention_bf16(float *out,
+                               const float *Q, const float *K, const float *V,
+                               float *scores_scratch,
+                               int heads, int seq_q, int seq_k, int head_dim,
+                               float scale) {
+    if (!g_initialized || heads <= 0) return;
+    if (!g_shaders_initialized || !g_bmm_half_qkt_pipeline ||
+        !g_bmm_half_sv_pipeline || !g_softmax_half_pipeline) {
+        /* Fall back to f32 attention if shaders not available */
+        flux_metal_attention(out, Q, K, V, scores_scratch,
+                            heads, seq_q, seq_k, head_dim, scale);
+        return;
+    }
+    (void)scores_scratch;  /* Unused - kept for interface compatibility */
+
+    @autoreleasepool {
+        size_t q_elements = (size_t)heads * seq_q * head_dim;
+        size_t k_elements = (size_t)heads * seq_k * head_dim;
+        size_t v_elements = (size_t)heads * seq_k * head_dim;
+        size_t out_elements = (size_t)heads * seq_q * head_dim;
+        size_t scores_elements = (size_t)heads * seq_q * seq_k;
+
+        size_t q_size_f16 = q_elements * sizeof(uint16_t);
+        size_t k_size_f16 = k_elements * sizeof(uint16_t);
+        size_t v_size_f16 = v_elements * sizeof(uint16_t);
+        size_t out_size_f16 = out_elements * sizeof(uint16_t);
+        size_t scores_size_f16 = scores_elements * sizeof(uint16_t);
+
+        /* Allocate f16 buffers */
+        id<MTLBuffer> bufQ = pool_get_buffer(q_size_f16);
+        id<MTLBuffer> bufK = pool_get_buffer(k_size_f16);
+        id<MTLBuffer> bufV = pool_get_buffer(v_size_f16);
+        id<MTLBuffer> bufScores = pool_get_buffer(scores_size_f16);
+        id<MTLBuffer> bufOut = pool_get_buffer(out_size_f16);
+
+        if (!bufQ || !bufK || !bufV || !bufScores || !bufOut) {
+            if (bufQ) pool_release_buffer(bufQ);
+            if (bufK) pool_release_buffer(bufK);
+            if (bufV) pool_release_buffer(bufV);
+            if (bufScores) pool_release_buffer(bufScores);
+            if (bufOut) pool_release_buffer(bufOut);
+            return;
+        }
+
+        /* Convert f32 inputs to f16 */
+        uint16_t *q_f16 = (uint16_t *)[bufQ contents];
+        uint16_t *k_f16 = (uint16_t *)[bufK contents];
+        uint16_t *v_f16 = (uint16_t *)[bufV contents];
+
+        for (size_t i = 0; i < q_elements; i++) {
+            q_f16[i] = f32_to_f16(Q[i]);
+        }
+        for (size_t i = 0; i < k_elements; i++) {
+            k_f16[i] = f32_to_f16(K[i]);
+        }
+        for (size_t i = 0; i < v_elements; i++) {
+            v_f16[i] = f32_to_f16(V[i]);
+        }
+
+        id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
+
+        /* === Phase 1: Q @ K^T using custom half compute shader === */
+        {
+            id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+            [encoder setComputePipelineState:g_bmm_half_qkt_pipeline];
+
+            [encoder setBuffer:bufQ offset:0 atIndex:0];
+            [encoder setBuffer:bufK offset:0 atIndex:1];
+            [encoder setBuffer:bufScores offset:0 atIndex:2];
+            [encoder setBytes:&seq_q length:sizeof(int) atIndex:3];
+            [encoder setBytes:&seq_k length:sizeof(int) atIndex:4];
+            [encoder setBytes:&head_dim length:sizeof(int) atIndex:5];
+            [encoder setBytes:&heads length:sizeof(int) atIndex:6];
+            [encoder setBytes:&scale length:sizeof(float) atIndex:7];
+
+            /* Dispatch: threadgroups cover output [batch, M, N] */
+            uint TILE_SIZE = 16;
+            MTLSize threadsPerGroup = MTLSizeMake(TILE_SIZE, TILE_SIZE, 1);
+            MTLSize numGroups = MTLSizeMake(
+                (seq_k + TILE_SIZE - 1) / TILE_SIZE,
+                (seq_q + TILE_SIZE - 1) / TILE_SIZE,
+                heads);
+
+            [encoder dispatchThreadgroups:numGroups threadsPerThreadgroup:threadsPerGroup];
+            [encoder endEncoding];
+        }
+
+        /* === Phase 2: Softmax on GPU === */
+        {
+            id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+            [encoder setComputePipelineState:g_softmax_half_pipeline];
+
+            [encoder setBuffer:bufScores offset:0 atIndex:0];
+            int total_rows = heads * seq_q;
+            [encoder setBytes:&total_rows length:sizeof(int) atIndex:1];
+            [encoder setBytes:&seq_k length:sizeof(int) atIndex:2];
+
+            NSUInteger threadsPerGroup = MIN(256, (NSUInteger)seq_k);
+            MTLSize numGroups = MTLSizeMake(total_rows, 1, 1);
+            MTLSize groupSize = MTLSizeMake(threadsPerGroup, 1, 1);
+
+            [encoder dispatchThreadgroups:numGroups threadsPerThreadgroup:groupSize];
+            [encoder endEncoding];
+        }
+
+        /* === Phase 3: scores @ V using custom half compute shader === */
+        {
+            id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+            [encoder setComputePipelineState:g_bmm_half_sv_pipeline];
+
+            [encoder setBuffer:bufScores offset:0 atIndex:0];
+            [encoder setBuffer:bufV offset:0 atIndex:1];
+            [encoder setBuffer:bufOut offset:0 atIndex:2];
+            [encoder setBytes:&seq_q length:sizeof(int) atIndex:3];
+            [encoder setBytes:&seq_k length:sizeof(int) atIndex:4];
+            [encoder setBytes:&head_dim length:sizeof(int) atIndex:5];
+            [encoder setBytes:&heads length:sizeof(int) atIndex:6];
+
+            /* Dispatch: threadgroups cover output [batch, M, N] */
+            uint TILE_SIZE = 16;
+            MTLSize threadsPerGroup = MTLSizeMake(TILE_SIZE, TILE_SIZE, 1);
+            MTLSize numGroups = MTLSizeMake(
+                (head_dim + TILE_SIZE - 1) / TILE_SIZE,
+                (seq_q + TILE_SIZE - 1) / TILE_SIZE,
+                heads);
+
+            [encoder dispatchThreadgroups:numGroups threadsPerThreadgroup:threadsPerGroup];
+            [encoder endEncoding];
+        }
+
+        /* Execute all phases */
+        [cmdBuffer commit];
+        [cmdBuffer waitUntilCompleted];
+
+        /* Convert f16 output back to f32 */
+        uint16_t *out_f16 = (uint16_t *)[bufOut contents];
+        for (size_t i = 0; i < out_elements; i++) {
+            out[i] = f16_to_f32(out_f16[i]);
+        }
+
+        /* Release pooled buffers */
+        pool_release_buffer(bufQ);
+        pool_release_buffer(bufK);
+        pool_release_buffer(bufV);
+        pool_release_buffer(bufScores);
+        pool_release_buffer(bufOut);
+    }
+}
+
+/* ========================================================================
+ * Native BF16 Attention (no conversion overhead)
+ *
+ * This function works with native bf16 GPU tensors - no f32<->bf16 conversion
+ * is performed. The bf16 data stays in bf16 format throughout, with f32
+ * accumulation only in the compute shaders.
+ *
+ * Q, K, V: GPU buffers containing bf16 data [heads, seq_q/seq_k, head_dim]
+ * out: GPU buffer to write bf16 result [heads, seq_q, head_dim]
+ * ======================================================================== */
+void flux_metal_attention_bf16_native(id<MTLBuffer> bufQ, id<MTLBuffer> bufK,
+                                       id<MTLBuffer> bufV, id<MTLBuffer> bufOut,
+                                       int heads, int seq_q, int seq_k, int head_dim,
+                                       float scale) {
+    if (!g_initialized || heads <= 0) return;
+    if (!g_shaders_initialized || !g_bmm_bf16_qkt_pipeline ||
+        !g_bmm_bf16_sv_pipeline || !g_softmax_bf16_pipeline) {
+        fprintf(stderr, "BF16 attention: shaders not available\n");
+        return;
+    }
+
+    @autoreleasepool {
+        size_t scores_elements = (size_t)heads * seq_q * seq_k;
+        size_t scores_size = scores_elements * sizeof(uint16_t);  /* bf16 = 2 bytes */
+
+        id<MTLBuffer> bufScores = pool_get_buffer(scores_size);
+        if (!bufScores) return;
+
+        id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
+
+        /* === Phase 1: Q @ K^T using bf16 compute shader === */
+        {
+            id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+            [encoder setComputePipelineState:g_bmm_bf16_qkt_pipeline];
+
+            [encoder setBuffer:bufQ offset:0 atIndex:0];
+            [encoder setBuffer:bufK offset:0 atIndex:1];
+            [encoder setBuffer:bufScores offset:0 atIndex:2];
+            [encoder setBytes:&seq_q length:sizeof(int) atIndex:3];
+            [encoder setBytes:&seq_k length:sizeof(int) atIndex:4];
+            [encoder setBytes:&head_dim length:sizeof(int) atIndex:5];
+            [encoder setBytes:&heads length:sizeof(int) atIndex:6];
+            [encoder setBytes:&scale length:sizeof(float) atIndex:7];
+
+            uint TILE_SIZE = 16;
+            MTLSize threadsPerGroup = MTLSizeMake(TILE_SIZE, TILE_SIZE, 1);
+            MTLSize numGroups = MTLSizeMake(
+                (seq_k + TILE_SIZE - 1) / TILE_SIZE,
+                (seq_q + TILE_SIZE - 1) / TILE_SIZE,
+                heads);
+
+            [encoder dispatchThreadgroups:numGroups threadsPerThreadgroup:threadsPerGroup];
+            [encoder endEncoding];
+        }
+
+        /* === Phase 2: Softmax on GPU (bf16) === */
+        {
+            id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+            [encoder setComputePipelineState:g_softmax_bf16_pipeline];
+
+            [encoder setBuffer:bufScores offset:0 atIndex:0];
+            int total_rows = heads * seq_q;
+            [encoder setBytes:&total_rows length:sizeof(int) atIndex:1];
+            [encoder setBytes:&seq_k length:sizeof(int) atIndex:2];
+
+            NSUInteger threadsPerGroup = MIN(256, (NSUInteger)seq_k);
+            MTLSize numGroups = MTLSizeMake(total_rows, 1, 1);
+            MTLSize groupSize = MTLSizeMake(threadsPerGroup, 1, 1);
+
+            [encoder dispatchThreadgroups:numGroups threadsPerThreadgroup:groupSize];
+            [encoder endEncoding];
+        }
+
+        /* === Phase 3: scores @ V using bf16 compute shader === */
+        {
+            id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+            [encoder setComputePipelineState:g_bmm_bf16_sv_pipeline];
+
+            [encoder setBuffer:bufScores offset:0 atIndex:0];
+            [encoder setBuffer:bufV offset:0 atIndex:1];
+            [encoder setBuffer:bufOut offset:0 atIndex:2];
+            [encoder setBytes:&seq_q length:sizeof(int) atIndex:3];
+            [encoder setBytes:&seq_k length:sizeof(int) atIndex:4];
+            [encoder setBytes:&head_dim length:sizeof(int) atIndex:5];
+            [encoder setBytes:&heads length:sizeof(int) atIndex:6];
+
+            uint TILE_SIZE = 16;
+            MTLSize threadsPerGroup = MTLSizeMake(TILE_SIZE, TILE_SIZE, 1);
+            MTLSize numGroups = MTLSizeMake(
+                (head_dim + TILE_SIZE - 1) / TILE_SIZE,
+                (seq_q + TILE_SIZE - 1) / TILE_SIZE,
+                heads);
+
+            [encoder dispatchThreadgroups:numGroups threadsPerThreadgroup:threadsPerGroup];
+            [encoder endEncoding];
+        }
+
+        [cmdBuffer commit];
+        [cmdBuffer waitUntilCompleted];
+
+        pool_release_buffer(bufScores);
+    }
+}
+
+/* ========================================================================
+ * BF16 Pipeline API
+ *
+ * These functions work with native bf16 GPU tensors to implement the full
+ * bf16 pipeline. All operations keep data in bf16
+ * with f32 accumulation internally for numerical stability.
+ * ======================================================================== */
+
+/* Check if bf16 pipeline is available */
+int flux_bf16_pipeline_available(void) {
+    int ok = g_shaders_initialized &&
+             g_rms_norm_bf16_pipeline &&
+             g_qk_rms_norm_bf16_pipeline &&
+             g_adaln_norm_bf16_pipeline &&
+             g_silu_mul_bf16_pipeline &&
+             g_gated_add_bf16_pipeline &&
+             g_rope_unified_bf16_pipeline &&
+             g_rope_2d_bf16_pipeline &&
+             g_linear_bf16_pipeline &&
+             g_concat_seq_bf16_pipeline &&
+             g_slice_seq_bf16_pipeline &&
+             g_attention_fused_bf16_pipeline &&
+             g_f32_to_bf16_pipeline &&
+             g_bf16_to_f32_pipeline;
+
+    if (!ok && bf16_debug_enabled()) {
+        static int reported = 0;
+        if (!reported) {
+            reported = 1;
+            if (!g_shaders_initialized) fprintf(stderr, "[BF16] shaders not initialized\n");
+            if (!g_rms_norm_bf16_pipeline) fprintf(stderr, "[BF16] missing rms_norm_bf16\n");
+            if (!g_qk_rms_norm_bf16_pipeline) fprintf(stderr, "[BF16] missing qk_rms_norm_bf16\n");
+            if (!g_adaln_norm_bf16_pipeline) fprintf(stderr, "[BF16] missing adaln_norm_bf16\n");
+            if (!g_silu_mul_bf16_pipeline) fprintf(stderr, "[BF16] missing silu_mul_bf16\n");
+            if (!g_gated_add_bf16_pipeline) fprintf(stderr, "[BF16] missing gated_add_bf16\n");
+            if (!g_rope_unified_bf16_pipeline) fprintf(stderr, "[BF16] missing rope_unified_bf16\n");
+            if (!g_rope_2d_bf16_pipeline) fprintf(stderr, "[BF16] missing rope_2d_bf16\n");
+            if (!g_linear_bf16_pipeline) fprintf(stderr, "[BF16] missing linear_bf16\n");
+            if (!g_concat_seq_bf16_pipeline) fprintf(stderr, "[BF16] missing concat_seq_bf16\n");
+            if (!g_slice_seq_bf16_pipeline) fprintf(stderr, "[BF16] missing slice_seq_bf16\n");
+            if (!g_attention_fused_bf16_pipeline) {
+                fprintf(stderr, "[BF16] missing fused attention pipeline\n");
+            }
+            if (!g_f32_to_bf16_pipeline) fprintf(stderr, "[BF16] missing f32_to_bf16\n");
+            if (!g_bf16_to_f32_pipeline) fprintf(stderr, "[BF16] missing bf16_to_f32\n");
+        }
+    }
+
+    return ok;
+}
+
+/* Convert f32 tensor to bf16 on GPU */
+void flux_bf16_convert_f32_to_bf16(id<MTLBuffer> input_f32, id<MTLBuffer> output_bf16, int n) {
+    if (!g_shaders_initialized || !g_f32_to_bf16_pipeline) return;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_f32_to_bf16_pipeline];
+        [encoder setBuffer:input_f32 offset:0 atIndex:0];
+        [encoder setBuffer:output_bf16 offset:0 atIndex:1];
+        [encoder setBytes:&n length:sizeof(int) atIndex:2];
+
+        NSUInteger threads = 256;
+        NSUInteger groups = (n + threads - 1) / threads;
+        [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        [encoder endEncoding];
+
+        [cmdBuffer commit];
+        [cmdBuffer waitUntilCompleted];
+    }
+}
+
+/* Convert bf16 tensor to f32 on GPU */
+void flux_bf16_convert_bf16_to_f32(id<MTLBuffer> input_bf16, id<MTLBuffer> output_f32, int n) {
+    if (!g_shaders_initialized || !g_bf16_to_f32_pipeline) return;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_bf16_to_f32_pipeline];
+        [encoder setBuffer:input_bf16 offset:0 atIndex:0];
+        [encoder setBuffer:output_f32 offset:0 atIndex:1];
+        [encoder setBytes:&n length:sizeof(int) atIndex:2];
+
+        NSUInteger threads = 256;
+        NSUInteger groups = (n + threads - 1) / threads;
+        [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        [encoder endEncoding];
+
+        [cmdBuffer commit];
+        [cmdBuffer waitUntilCompleted];
+    }
+}
+
+/* RMSNorm on bf16 tensors */
+void flux_bf16_rms_norm(id<MTLBuffer> out, id<MTLBuffer> x, id<MTLBuffer> weight,
+                         int seq_len, int hidden, float eps) {
+    if (!g_shaders_initialized || !g_rms_norm_bf16_pipeline) return;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_rms_norm_bf16_pipeline];
+        [encoder setBuffer:x offset:0 atIndex:0];
+        [encoder setBuffer:weight offset:0 atIndex:1];
+        [encoder setBuffer:out offset:0 atIndex:2];
+        [encoder setBytes:&hidden length:sizeof(int) atIndex:3];
+        [encoder setBytes:&eps length:sizeof(float) atIndex:4];
+
+        NSUInteger threadsPerGroup = MIN(256, (NSUInteger)hidden);
+        [encoder dispatchThreadgroups:MTLSizeMake(seq_len, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+        [encoder endEncoding];
+
+        [cmdBuffer commit];
+        [cmdBuffer waitUntilCompleted];
+    }
+}
+
+/* QK RMSNorm on bf16 tensors (in-place) */
+void flux_bf16_qk_rms_norm(id<MTLBuffer> q, id<MTLBuffer> k,
+                            id<MTLBuffer> q_weight, id<MTLBuffer> k_weight,
+                            int seq, int heads, int head_dim, float eps) {
+    if (!g_shaders_initialized || !g_qk_rms_norm_bf16_pipeline) return;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_qk_rms_norm_bf16_pipeline];
+        [encoder setBuffer:q offset:0 atIndex:0];
+        [encoder setBuffer:k offset:0 atIndex:1];
+        [encoder setBuffer:q_weight offset:0 atIndex:2];
+        [encoder setBuffer:k_weight offset:0 atIndex:3];
+        [encoder setBytes:&heads length:sizeof(int) atIndex:4];
+        [encoder setBytes:&head_dim length:sizeof(int) atIndex:5];
+        [encoder setBytes:&eps length:sizeof(float) atIndex:6];
+
+        [encoder dispatchThreadgroups:MTLSizeMake(seq, heads, 1)
+                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [encoder endEncoding];
+
+        [cmdBuffer commit];
+        [cmdBuffer waitUntilCompleted];
+    }
+}
+
+/* SiLU on bf16 tensors (in-place) */
+void flux_bf16_silu(id<MTLBuffer> x, int n) {
+    if (!g_shaders_initialized || !g_silu_bf16_pipeline) return;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_silu_bf16_pipeline];
+        [encoder setBuffer:x offset:0 atIndex:0];
+        [encoder setBytes:&n length:sizeof(int) atIndex:1];
+
+        NSUInteger threads = 256;
+        NSUInteger groups = (n + threads - 1) / threads;
+        [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        [encoder endEncoding];
+
+        [cmdBuffer commit];
+        [cmdBuffer waitUntilCompleted];
+    }
+}
+
+/* SiLU with multiply on bf16 tensors: gate = silu(gate) * up */
+void flux_bf16_silu_mul(id<MTLBuffer> gate, id<MTLBuffer> up, int n) {
+    if (!g_shaders_initialized || !g_silu_mul_bf16_pipeline) return;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_silu_mul_bf16_pipeline];
+        [encoder setBuffer:gate offset:0 atIndex:0];
+        [encoder setBuffer:up offset:0 atIndex:1];
+        [encoder setBytes:&n length:sizeof(int) atIndex:2];
+
+        NSUInteger threads = 256;
+        NSUInteger groups = (n + threads - 1) / threads;
+        [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        [encoder endEncoding];
+
+        [cmdBuffer commit];
+        [cmdBuffer waitUntilCompleted];
+    }
+}
+
+/* RoPE on bf16 tensors */
+void flux_bf16_rope_unified(id<MTLBuffer> x,
+                             const float *txt_cos, const float *txt_sin,
+                             const float *img_cos, const float *img_sin,
+                             int seq, int img_offset, int heads, int head_dim) {
+    if (!g_shaders_initialized || !g_rope_unified_bf16_pipeline) return;
+
+    @autoreleasepool {
+        /* Get cached frequency buffers */
+        int txt_len = img_offset;
+        int img_len = seq - img_offset;
+        size_t txt_size = (size_t)txt_len * head_dim * sizeof(float);
+        size_t img_size = (size_t)img_len * head_dim * sizeof(float);
+
+        id<MTLBuffer> bufTxtCos = get_cached_weight_buffer(txt_cos, txt_size);
+        id<MTLBuffer> bufTxtSin = get_cached_weight_buffer(txt_sin, txt_size);
+        id<MTLBuffer> bufImgCos = get_cached_weight_buffer(img_cos, img_size);
+        id<MTLBuffer> bufImgSin = get_cached_weight_buffer(img_sin, img_size);
+
+        if (!bufTxtCos || !bufTxtSin || !bufImgCos || !bufImgSin) return;
+
+        id<MTLCommandBuffer> cmdBuffer = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        int axis_dim = 32;  /* FLUX uses 32 */
+        [encoder setComputePipelineState:g_rope_unified_bf16_pipeline];
+        [encoder setBuffer:x offset:0 atIndex:0];
+        [encoder setBuffer:bufTxtCos offset:0 atIndex:1];
+        [encoder setBuffer:bufTxtSin offset:0 atIndex:2];
+        [encoder setBuffer:bufImgCos offset:0 atIndex:3];
+        [encoder setBuffer:bufImgSin offset:0 atIndex:4];
+        [encoder setBytes:&seq length:sizeof(int) atIndex:5];
+        [encoder setBytes:&img_offset length:sizeof(int) atIndex:6];
+        [encoder setBytes:&heads length:sizeof(int) atIndex:7];
+        [encoder setBytes:&head_dim length:sizeof(int) atIndex:8];
+        [encoder setBytes:&axis_dim length:sizeof(int) atIndex:9];
+
+        [encoder dispatchThreadgroups:MTLSizeMake(seq, heads, 1)
+                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [encoder endEncoding];
+
+        [cmdBuffer commit];
+        [cmdBuffer waitUntilCompleted];
+    }
+}
+
+/* GPU Tensor API Implementation
  * ======================================================================== */
 
 /* Internal tensor structure */
@@ -1302,6 +2042,7 @@ struct flux_gpu_tensor {
     size_t num_elements;
     int has_pending_work;  /* Flag to track if GPU work is pending */
     int persistent;        /* If set, don't release to pool on free */
+    int is_f16;            /* 1 if float16, 0 if float32 */
 };
 
 /* Pending command buffer for batched operations */
@@ -1311,6 +2052,14 @@ static int g_tensor_batch_mode = 0;
 /* Chain mode - keep data on GPU between operations */
 static id<MTLCommandBuffer> g_chain_cmd = nil;
 static int g_chain_mode = 0;
+
+static int tensor_batch_active(void) {
+    return g_tensor_batch_mode;
+}
+
+static int tensor_chain_active(void) {
+    return g_chain_mode;
+}
 
 flux_gpu_tensor_t flux_gpu_tensor_create(const float *data, size_t num_elements) {
     if (!g_initialized || !data || num_elements == 0) return NULL;
@@ -1336,6 +2085,7 @@ flux_gpu_tensor_t flux_gpu_tensor_create(const float *data, size_t num_elements)
         tensor->num_elements = num_elements;
         tensor->has_pending_work = 0;
         tensor->persistent = 0;
+        tensor->is_f16 = 0;
 
         return tensor;
     }
@@ -1351,6 +2101,10 @@ flux_gpu_tensor_t flux_gpu_tensor_alloc(size_t num_elements) {
         id<MTLBuffer> buf = pool_get_buffer(size);
         if (!buf) return NULL;
 
+        if (tensor_zero_init_enabled()) {
+            memset([buf contents], 0, size);
+        }
+
         /* Allocate tensor structure */
         flux_gpu_tensor_t tensor = (flux_gpu_tensor_t)malloc(sizeof(struct flux_gpu_tensor));
         if (!tensor) {
@@ -1362,6 +2116,37 @@ flux_gpu_tensor_t flux_gpu_tensor_alloc(size_t num_elements) {
         tensor->num_elements = num_elements;
         tensor->has_pending_work = 0;
         tensor->persistent = 0;
+        tensor->is_f16 = 0;
+
+        return tensor;
+    }
+}
+
+/* Allocate f16 GPU tensor (half the memory of f32) */
+flux_gpu_tensor_t flux_gpu_tensor_alloc_f16(size_t num_elements) {
+    if (!g_initialized || num_elements == 0) return NULL;
+
+    @autoreleasepool {
+        size_t size = num_elements * sizeof(uint16_t);  /* f16 = 2 bytes */
+
+        id<MTLBuffer> buf = pool_get_buffer(size);
+        if (!buf) return NULL;
+
+        if (tensor_zero_init_enabled()) {
+            memset([buf contents], 0, size);
+        }
+
+        flux_gpu_tensor_t tensor = (flux_gpu_tensor_t)malloc(sizeof(struct flux_gpu_tensor));
+        if (!tensor) {
+            pool_release_buffer(buf);
+            return NULL;
+        }
+
+        tensor->buffer = buf;
+        tensor->num_elements = num_elements;
+        tensor->has_pending_work = 0;
+        tensor->persistent = 0;
+        tensor->is_f16 = 1;
 
         return tensor;
     }
@@ -1378,6 +2163,10 @@ flux_gpu_tensor_t flux_gpu_tensor_alloc_persistent(size_t num_elements) {
                                                   options:MTLResourceStorageModeShared];
         if (!buf) return NULL;
 
+        if (tensor_zero_init_enabled()) {
+            memset([buf contents], 0, size);
+        }
+
         /* Allocate tensor structure */
         flux_gpu_tensor_t tensor = (flux_gpu_tensor_t)malloc(sizeof(struct flux_gpu_tensor));
         if (!tensor) {
@@ -1388,6 +2177,7 @@ flux_gpu_tensor_t flux_gpu_tensor_alloc_persistent(size_t num_elements) {
         tensor->num_elements = num_elements;
         tensor->has_pending_work = 0;
         tensor->persistent = 1;  /* Mark as persistent */
+        tensor->is_f16 = 0;
 
         return tensor;
     }
@@ -1411,6 +2201,21 @@ void flux_gpu_tensor_read(flux_gpu_tensor_t tensor, float *out) {
     /* Copy from shared memory buffer */
     size_t size = tensor->num_elements * sizeof(float);
     memcpy(out, [tensor->buffer contents], size);
+}
+
+void flux_gpu_tensor_write(flux_gpu_tensor_t tensor, const float *data) {
+    if (!tensor || !data) return;
+
+    /* If there's pending work that reads this tensor, sync first */
+    if (tensor->has_pending_work) {
+        flux_gpu_sync();
+        tensor->has_pending_work = 0;
+    }
+
+    /* Copy to shared memory buffer */
+    size_t elem_size = tensor->is_f16 ? sizeof(uint16_t) : sizeof(float);
+    size_t size = tensor->num_elements * elem_size;
+    memcpy([tensor->buffer contents], data, size);
 }
 
 float *flux_gpu_tensor_data(flux_gpu_tensor_t tensor) {
@@ -1438,6 +2243,18 @@ size_t flux_gpu_tensor_size(flux_gpu_tensor_t tensor) {
     return tensor->num_elements;
 }
 
+/* Get the underlying Metal buffer from a GPU tensor (for use with bf16 API) */
+id<MTLBuffer> flux_gpu_tensor_get_buffer(flux_gpu_tensor_t tensor) {
+    if (!tensor) return nil;
+    return tensor->buffer;
+}
+
+/* Check if tensor is bf16/f16 format */
+int flux_gpu_tensor_is_f16(flux_gpu_tensor_t tensor) {
+    if (!tensor) return 0;
+    return tensor->is_f16;
+}
+
 void flux_gpu_sync(void) {
     if (!g_initialized) return;
 
@@ -1446,6 +2263,13 @@ void flux_gpu_sync(void) {
             [g_tensor_cmd commit];
             [g_tensor_cmd waitUntilCompleted];
             g_tensor_cmd = nil;
+            pool_flush_deferred();
+        }
+        /* If in batch mode, create a new command buffer so subsequent
+         * operations continue to be batched properly. Without this,
+         * ops after sync would create orphan buffers that never execute. */
+        if (g_tensor_batch_mode) {
+            g_tensor_cmd = [g_queue commandBuffer];
         }
     }
 }
@@ -1454,6 +2278,7 @@ void flux_gpu_batch_begin(void) {
     if (!g_initialized || g_tensor_batch_mode) return;
 
     @autoreleasepool {
+        pool_flush_deferred();
         g_tensor_cmd = [g_queue commandBuffer];
         g_tensor_batch_mode = 1;
     }
@@ -1468,6 +2293,7 @@ void flux_gpu_batch_end(void) {
             [g_tensor_cmd waitUntilCompleted];
             g_tensor_cmd = nil;
         }
+        pool_flush_deferred();
         g_tensor_batch_mode = 0;
     }
 }
@@ -1494,6 +2320,7 @@ void flux_gpu_chain_end(void) {
             [g_chain_cmd waitUntilCompleted];
             g_chain_cmd = nil;
         }
+        pool_flush_deferred();
         g_chain_mode = 0;
     }
 }
@@ -1682,6 +2509,327 @@ flux_gpu_tensor_t flux_gpu_linear_bf16(flux_gpu_tensor_t x,
     }
 }
 
+/* GPU linear with bf16 weights - outputs bf16 tensor for full bf16 pipeline
+ * Uses native bf16 (MPSDataTypeBFloat16). */
+flux_gpu_tensor_t flux_gpu_linear_bf16_bf16out(flux_gpu_tensor_t x,
+                                               const uint16_t *W_bf16,
+                                               int seq_len, int in_dim, int out_dim) {
+    if (!g_initialized || !x || !W_bf16) return NULL;
+
+    @autoreleasepool {
+        size_t out_elements = (size_t)seq_len * out_dim;
+        flux_gpu_tensor_t out = flux_gpu_tensor_alloc_f16(out_elements);  /* Same size as bf16 */
+        if (!out) return NULL;
+
+        /* Get cached bf16 weight buffer (native, no conversion) */
+        size_t numW = (size_t)out_dim * in_dim;
+        id<MTLBuffer> bufW = get_cached_bf16_buffer(W_bf16, numW);
+        if (!bufW) {
+            flux_gpu_tensor_free(out);
+            return NULL;
+        }
+
+        /* Determine input dtype - for bf16 pipeline, input should also be bf16 */
+        int x_is_f16 = x->is_f16;  /* In bf16 mode, this means bf16 */
+
+        /* Create matrix descriptors using native bf16
+         * x: [seq_len, in_dim] (f32 or bf16)
+         * W: [out_dim, in_dim] (bf16)
+         * out: [seq_len, out_dim] (bf16)
+         */
+        MPSMatrixDescriptor *descX = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:seq_len columns:in_dim
+                            rowBytes:in_dim * (x_is_f16 ? sizeof(uint16_t) : sizeof(float))
+                            dataType:x_is_f16 ? MPSDataTypeBFloat16 : MPSDataTypeFloat32];
+        MPSMatrixDescriptor *descW = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:out_dim columns:in_dim
+                            rowBytes:in_dim * sizeof(uint16_t)
+                            dataType:MPSDataTypeBFloat16];
+        MPSMatrixDescriptor *descOut = [MPSMatrixDescriptor
+            matrixDescriptorWithRows:seq_len columns:out_dim
+                            rowBytes:out_dim * sizeof(uint16_t)
+                            dataType:MPSDataTypeBFloat16];
+
+        MPSMatrix *matX = [[MPSMatrix alloc] initWithBuffer:x->buffer descriptor:descX];
+        MPSMatrix *matW = [[MPSMatrix alloc] initWithBuffer:bufW descriptor:descW];
+        MPSMatrix *matOut = [[MPSMatrix alloc] initWithBuffer:out->buffer descriptor:descOut];
+
+        MPSMatrixMultiplication *matmul = [[MPSMatrixMultiplication alloc]
+            initWithDevice:g_device
+               transposeLeft:NO
+              transposeRight:YES
+                  resultRows:seq_len
+               resultColumns:out_dim
+             interiorColumns:in_dim
+                       alpha:1.0f
+                        beta:0.0f];
+
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        [matmul encodeToCommandBuffer:cmdBuffer
+                           leftMatrix:matX
+                          rightMatrix:matW
+                         resultMatrix:matOut];
+
+        out->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+        }
+
+        if (g_tensor_batch_mode) {
+            x->has_pending_work = 1;
+        }
+
+        return out;
+    }
+}
+
+/* ========================================================================
+ * Half-Precision MPS Attention (for GPU tensors)
+ *
+ * MPS attention for f16 GPU tensors. Uses MPSDataTypeFloat16 for
+ * reduced memory bandwidth.
+ *
+ * Q: [seq_q, heads * head_dim] (f16)
+ * K: [seq_k, heads * head_dim] (f16)
+ * V: [seq_k, heads * head_dim] (f16)
+ * out: [seq_q, heads * head_dim] (f16)
+ * ======================================================================== */
+int flux_gpu_attention_mps_bf16(flux_gpu_tensor_t out,
+                                flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+                                int seq_q, int seq_k, int num_heads, int head_dim, float scale) {
+    if (!g_initialized || !out || !Q || !K || !V) return 0;
+    if (!Q->is_f16 || !K->is_f16 || !V->is_f16 || !out->is_f16) return 0;  /* is_f16 means 16-bit */
+
+    @autoreleasepool {
+        size_t hidden = num_heads * head_dim;
+        size_t scores_elements = (size_t)num_heads * seq_q * seq_k;
+        size_t scores_size = scores_elements * sizeof(uint16_t);
+
+        /* Allocate scores buffer (f16) */
+        id<MTLBuffer> bufScores = pool_get_buffer(scores_size);
+        if (!bufScores) return 0;
+
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+
+        /* === Phase 1: Q @ K^T for each head === */
+        /* Q: [seq_q, heads * head_dim] -> treat as heads matrices of [seq_q, head_dim]
+         * K: [seq_k, heads * head_dim] -> treat as heads matrices of [seq_k, head_dim]
+         * scores: [heads, seq_q, seq_k] */
+        {
+            MPSMatrixDescriptor *descQ = [MPSMatrixDescriptor
+                matrixDescriptorWithRows:seq_q columns:head_dim
+                                rowBytes:hidden * sizeof(uint16_t)  /* stride to next row */
+                                dataType:MPSDataTypeFloat16];
+            MPSMatrixDescriptor *descK = [MPSMatrixDescriptor
+                matrixDescriptorWithRows:seq_k columns:head_dim
+                                rowBytes:hidden * sizeof(uint16_t)
+                                dataType:MPSDataTypeFloat16];
+            MPSMatrixDescriptor *descScores = [MPSMatrixDescriptor
+                matrixDescriptorWithRows:seq_q columns:seq_k
+                                rowBytes:seq_k * sizeof(uint16_t)
+                                dataType:MPSDataTypeFloat16];
+
+            MPSMatrixMultiplication *matmul_qk = [[MPSMatrixMultiplication alloc]
+                initWithDevice:g_device
+                   transposeLeft:NO
+                  transposeRight:YES
+                      resultRows:seq_q
+                   resultColumns:seq_k
+                 interiorColumns:head_dim
+                           alpha:scale
+                            beta:0.0f];
+
+            for (int h = 0; h < num_heads; h++) {
+                size_t q_offset = h * head_dim * sizeof(uint16_t);
+                size_t k_offset = h * head_dim * sizeof(uint16_t);
+                size_t s_offset = h * seq_q * seq_k * sizeof(uint16_t);
+
+                MPSMatrix *matQ = [[MPSMatrix alloc] initWithBuffer:Q->buffer offset:q_offset descriptor:descQ];
+                MPSMatrix *matK = [[MPSMatrix alloc] initWithBuffer:K->buffer offset:k_offset descriptor:descK];
+                MPSMatrix *matScores = [[MPSMatrix alloc] initWithBuffer:bufScores offset:s_offset descriptor:descScores];
+
+                [matmul_qk encodeToCommandBuffer:cmdBuffer
+                                      leftMatrix:matQ
+                                     rightMatrix:matK
+                                    resultMatrix:matScores];
+            }
+        }
+
+        /* === Phase 2: Softmax (convert f16->f32, softmax, f32->f16) === */
+        /* Softmax needs higher precision internally, so we convert to f32 */
+        {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+
+            /* Read f16 scores, convert to f32, softmax, convert back to f16 */
+            size_t f32_size = scores_elements * sizeof(float);
+            float *scores_f32 = malloc(f32_size);
+            uint16_t *scores_f16 = (uint16_t *)[bufScores contents];
+
+            /* f16 to f32 conversion */
+            for (size_t i = 0; i < scores_elements; i++) {
+                scores_f32[i] = f16_to_f32(scores_f16[i]);
+            }
+
+            /* Softmax on CPU (f32 precision) */
+            extern void flux_softmax(float *x, int rows, int cols);
+            int total_rows = num_heads * seq_q;
+            flux_softmax(scores_f32, total_rows, seq_k);
+
+            /* f32 to f16 conversion */
+            for (size_t i = 0; i < scores_elements; i++) {
+                scores_f16[i] = f32_to_f16(scores_f32[i]);
+            }
+
+            free(scores_f32);
+            cmdBuffer = get_tensor_cmd();
+        }
+
+        /* === Phase 3: scores @ V for each head === */
+        {
+            MPSMatrixDescriptor *descScores = [MPSMatrixDescriptor
+                matrixDescriptorWithRows:seq_q columns:seq_k
+                                rowBytes:seq_k * sizeof(uint16_t)
+                                dataType:MPSDataTypeFloat16];
+            MPSMatrixDescriptor *descV = [MPSMatrixDescriptor
+                matrixDescriptorWithRows:seq_k columns:head_dim
+                                rowBytes:hidden * sizeof(uint16_t)
+                                dataType:MPSDataTypeFloat16];
+            MPSMatrixDescriptor *descOut = [MPSMatrixDescriptor
+                matrixDescriptorWithRows:seq_q columns:head_dim
+                                rowBytes:hidden * sizeof(uint16_t)
+                                dataType:MPSDataTypeFloat16];
+
+            MPSMatrixMultiplication *matmul_sv = [[MPSMatrixMultiplication alloc]
+                initWithDevice:g_device
+                   transposeLeft:NO
+                  transposeRight:NO
+                      resultRows:seq_q
+                   resultColumns:head_dim
+                 interiorColumns:seq_k
+                           alpha:1.0f
+                            beta:0.0f];
+
+            for (int h = 0; h < num_heads; h++) {
+                size_t s_offset = h * seq_q * seq_k * sizeof(uint16_t);
+                size_t v_offset = h * head_dim * sizeof(uint16_t);
+                size_t o_offset = h * head_dim * sizeof(uint16_t);
+
+                MPSMatrix *matScores = [[MPSMatrix alloc] initWithBuffer:bufScores offset:s_offset descriptor:descScores];
+                MPSMatrix *matV = [[MPSMatrix alloc] initWithBuffer:V->buffer offset:v_offset descriptor:descV];
+                MPSMatrix *matOut = [[MPSMatrix alloc] initWithBuffer:out->buffer offset:o_offset descriptor:descOut];
+
+                [matmul_sv encodeToCommandBuffer:cmdBuffer
+                                      leftMatrix:matScores
+                                     rightMatrix:matV
+                                    resultMatrix:matOut];
+            }
+        }
+
+        out->has_pending_work = 1;
+        Q->has_pending_work = 1;
+        K->has_pending_work = 1;
+        V->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+            Q->has_pending_work = 0;
+            K->has_pending_work = 0;
+            V->has_pending_work = 0;
+        }
+
+        pool_release_buffer(bufScores);
+        return 1;
+    }
+}
+
+/* ========================================================================
+ * Half-Precision Attention with f32 Tensor Interface
+ *
+ * Wrapper that takes f32 GPU tensors, converts to f16, does f16 attention,
+ * and converts output back to f32. Provides 2x memory bandwidth savings
+ * on attention matmuls while keeping the rest of the pipeline in f32.
+ * ======================================================================== */
+int flux_gpu_attention_bf16(flux_gpu_tensor_t out,
+                            flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+                            int seq_q, int seq_k, int num_heads, int head_dim, float scale) {
+    if (!g_initialized || !out || !Q || !K || !V) return 0;
+
+    @autoreleasepool {
+        size_t q_elements = (size_t)seq_q * num_heads * head_dim;
+        size_t k_elements = (size_t)seq_k * num_heads * head_dim;
+        size_t v_elements = (size_t)seq_k * num_heads * head_dim;
+        size_t out_elements = (size_t)seq_q * num_heads * head_dim;
+
+        /* Allocate f16 tensors */
+        flux_gpu_tensor_t q_f16 = flux_gpu_tensor_alloc_f16(q_elements);
+        flux_gpu_tensor_t k_f16 = flux_gpu_tensor_alloc_f16(k_elements);
+        flux_gpu_tensor_t v_f16 = flux_gpu_tensor_alloc_f16(v_elements);
+        flux_gpu_tensor_t out_f16 = flux_gpu_tensor_alloc_f16(out_elements);
+
+        if (!q_f16 || !k_f16 || !v_f16 || !out_f16) {
+            if (q_f16) flux_gpu_tensor_free(q_f16);
+            if (k_f16) flux_gpu_tensor_free(k_f16);
+            if (v_f16) flux_gpu_tensor_free(v_f16);
+            if (out_f16) flux_gpu_tensor_free(out_f16);
+            return 0;
+        }
+
+        /* Sync to ensure f32 tensors are ready */
+        if (Q->has_pending_work || K->has_pending_work || V->has_pending_work) {
+            flux_gpu_sync();
+        }
+
+        /* Convert f32 to f16 on CPU (fast on unified memory) */
+        float *q_f32 = (float *)[Q->buffer contents];
+        float *k_f32 = (float *)[K->buffer contents];
+        float *v_f32 = (float *)[V->buffer contents];
+        uint16_t *q_f16_data = (uint16_t *)[q_f16->buffer contents];
+        uint16_t *k_f16_data = (uint16_t *)[k_f16->buffer contents];
+        uint16_t *v_f16_data = (uint16_t *)[v_f16->buffer contents];
+
+        for (size_t i = 0; i < q_elements; i++) {
+            q_f16_data[i] = f32_to_f16(q_f32[i]);
+        }
+        for (size_t i = 0; i < k_elements; i++) {
+            k_f16_data[i] = f32_to_f16(k_f32[i]);
+        }
+        for (size_t i = 0; i < v_elements; i++) {
+            v_f16_data[i] = f32_to_f16(v_f32[i]);
+        }
+
+        /* Do f16 attention */
+        int success = flux_gpu_attention_mps_bf16(out_f16, q_f16, k_f16, v_f16,
+                                                   seq_q, seq_k, num_heads, head_dim, scale);
+
+        if (success) {
+            /* Sync and convert f16 output back to f32 */
+            if (out_f16->has_pending_work) {
+                flux_gpu_sync();
+            }
+
+            uint16_t *out_f16_data = (uint16_t *)[out_f16->buffer contents];
+            float *out_f32 = (float *)[out->buffer contents];
+
+            for (size_t i = 0; i < out_elements; i++) {
+                out_f32[i] = f16_to_f32(out_f16_data[i]);
+            }
+        }
+
+        flux_gpu_tensor_free(q_f16);
+        flux_gpu_tensor_free(k_f16);
+        flux_gpu_tensor_free(v_f16);
+        flux_gpu_tensor_free(out_f16);
+
+        return success;
+    }
+}
+
 /* ========================================================================
  * Compute Shader Support
  * Custom Metal compute shaders for element-wise operations.
@@ -1702,7 +2850,10 @@ static id<MTLComputePipelineState> g_attention_fused_pipeline = nil;
 static id<MTLComputePipelineState> g_gated_add_pipeline = nil;
 static id<MTLComputePipelineState> g_split_qkv_mlp_pipeline = nil;
 static id<MTLComputePipelineState> g_concat_attn_mlp_pipeline = nil;
-static int g_shaders_initialized = 0;
+static id<MTLComputePipelineState> g_bmm_half_qkt_pipeline = nil;
+static id<MTLComputePipelineState> g_bmm_half_sv_pipeline = nil;
+static id<MTLComputePipelineState> g_softmax_half_pipeline = nil;
+/* Note: BF16 pipelines are forward-declared at top of file */
 
 int flux_metal_shaders_available(void) {
     return g_shaders_initialized;
@@ -1892,6 +3043,139 @@ int flux_metal_init_shaders(void) {
                 fprintf(stderr, "Metal shaders: concat_attn_mlp pipeline failed: %s\n",
                         [[error localizedDescription] UTF8String]);
             }
+        }
+
+        func = [g_shader_library newFunctionWithName:@"batched_matmul_half_qkt"];
+        if (func) {
+            g_bmm_half_qkt_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+            if (!g_bmm_half_qkt_pipeline) {
+                fprintf(stderr, "Metal shaders: batched_matmul_half_qkt pipeline failed: %s\n",
+                        [[error localizedDescription] UTF8String]);
+            }
+        }
+
+        func = [g_shader_library newFunctionWithName:@"batched_matmul_half_sv"];
+        if (func) {
+            g_bmm_half_sv_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+            if (!g_bmm_half_sv_pipeline) {
+                fprintf(stderr, "Metal shaders: batched_matmul_half_sv pipeline failed: %s\n",
+                        [[error localizedDescription] UTF8String]);
+            }
+        }
+
+        func = [g_shader_library newFunctionWithName:@"softmax_half"];
+        if (func) {
+            g_softmax_half_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+            if (!g_softmax_half_pipeline) {
+                fprintf(stderr, "Metal shaders: softmax_half pipeline failed: %s\n",
+                        [[error localizedDescription] UTF8String]);
+            }
+        }
+
+        /* BF16 native shaders */
+        func = [g_shader_library newFunctionWithName:@"rms_norm_bf16"];
+        if (func) {
+            g_rms_norm_bf16_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+
+        func = [g_shader_library newFunctionWithName:@"qk_rms_norm_bf16"];
+        if (func) {
+            g_qk_rms_norm_bf16_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+
+        func = [g_shader_library newFunctionWithName:@"adaln_norm_bf16"];
+        if (func) {
+            g_adaln_norm_bf16_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+
+        func = [g_shader_library newFunctionWithName:@"silu_bf16"];
+        if (func) {
+            g_silu_bf16_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+
+        func = [g_shader_library newFunctionWithName:@"silu_mul_bf16"];
+        if (func) {
+            g_silu_mul_bf16_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+
+        func = [g_shader_library newFunctionWithName:@"gated_add_bf16"];
+        if (func) {
+            g_gated_add_bf16_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+
+        func = [g_shader_library newFunctionWithName:@"apply_rope_unified_bf16"];
+        if (func) {
+            g_rope_unified_bf16_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+
+        func = [g_shader_library newFunctionWithName:@"apply_rope_2d_bf16"];
+        if (func) {
+            g_rope_2d_bf16_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+
+        func = [g_shader_library newFunctionWithName:@"batched_matmul_bf16_qkt"];
+        if (func) {
+            g_bmm_bf16_qkt_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+
+        func = [g_shader_library newFunctionWithName:@"batched_matmul_bf16_sv"];
+        if (func) {
+            g_bmm_bf16_sv_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+
+        func = [g_shader_library newFunctionWithName:@"softmax_bf16"];
+        if (func) {
+            g_softmax_bf16_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+
+        func = [g_shader_library newFunctionWithName:@"f32_to_bf16_convert"];
+        if (func) {
+            g_f32_to_bf16_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+
+        func = [g_shader_library newFunctionWithName:@"bf16_to_f32_convert"];
+        if (func) {
+            g_bf16_to_f32_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+
+        func = [g_shader_library newFunctionWithName:@"linear_bf16"];
+        if (func) {
+            g_linear_bf16_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+
+        func = [g_shader_library newFunctionWithName:@"split_qkv_mlp_bf16"];
+        if (func) {
+            g_split_qkv_mlp_bf16_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+
+        func = [g_shader_library newFunctionWithName:@"concat_attn_mlp_bf16"];
+        if (func) {
+            g_concat_attn_mlp_bf16_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+
+        func = [g_shader_library newFunctionWithName:@"concat_seq_bf16"];
+        if (func) {
+            g_concat_seq_bf16_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+
+        func = [g_shader_library newFunctionWithName:@"slice_seq_bf16"];
+        if (func) {
+            g_slice_seq_bf16_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+
+        func = [g_shader_library newFunctionWithName:@"transpose_to_heads_bf16"];
+        if (func) {
+            g_transpose_to_heads_bf16_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+
+        func = [g_shader_library newFunctionWithName:@"transpose_from_heads_bf16"];
+        if (func) {
+            g_transpose_from_heads_bf16_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
+        }
+
+        func = [g_shader_library newFunctionWithName:@"attention_fused_bf16"];
+        if (func) {
+            g_attention_fused_bf16_pipeline = [g_device newComputePipelineStateWithFunction:func error:&error];
         }
 
         g_shaders_initialized = 1;
@@ -2712,6 +3996,1083 @@ int flux_gpu_attention_fused(flux_gpu_tensor_t out,
         }
 
         return 1;
+    }
+}
+
+/* Native BF16 attention using GPU tensor API.
+ * All tensors must be bf16 format (is_f16 = 1).
+ * Uses the bf16 compute shaders with f32 accumulation.
+ * Q, K, V: [heads, seq_q/seq_k, head_dim] in bf16
+ * out: [heads, seq_q, head_dim] in bf16
+ */
+int flux_gpu_attention_bf16_native(flux_gpu_tensor_t out,
+                                    flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+                                    int seq_q, int seq_k, int num_heads, int head_dim, float scale) {
+    if (!flux_bf16_pipeline_available()) return 0;
+    if (!out || !Q || !K || !V) return 0;
+    if (!out->is_f16 || !Q->is_f16 || !K->is_f16 || !V->is_f16) return 0;
+
+    @autoreleasepool {
+        size_t scores_elements = (size_t)num_heads * seq_q * seq_k;
+        size_t scores_size = scores_elements * sizeof(uint16_t);
+
+        id<MTLBuffer> bufScores = pool_get_buffer(scores_size);
+        if (!bufScores) return 0;
+
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+
+        /* Phase 1: Q @ K^T */
+        {
+            id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+            [encoder setComputePipelineState:g_bmm_bf16_qkt_pipeline];
+            [encoder setBuffer:Q->buffer offset:0 atIndex:0];
+            [encoder setBuffer:K->buffer offset:0 atIndex:1];
+            [encoder setBuffer:bufScores offset:0 atIndex:2];
+            [encoder setBytes:&seq_q length:sizeof(int) atIndex:3];
+            [encoder setBytes:&seq_k length:sizeof(int) atIndex:4];
+            [encoder setBytes:&head_dim length:sizeof(int) atIndex:5];
+            [encoder setBytes:&num_heads length:sizeof(int) atIndex:6];
+            [encoder setBytes:&scale length:sizeof(float) atIndex:7];
+
+            uint TILE_SIZE = 16;
+            MTLSize threadsPerGroup = MTLSizeMake(TILE_SIZE, TILE_SIZE, 1);
+            MTLSize numGroups = MTLSizeMake(
+                (seq_k + TILE_SIZE - 1) / TILE_SIZE,
+                (seq_q + TILE_SIZE - 1) / TILE_SIZE,
+                num_heads);
+            [encoder dispatchThreadgroups:numGroups threadsPerThreadgroup:threadsPerGroup];
+            [encoder endEncoding];
+        }
+
+        /* Phase 2: Softmax */
+        {
+            id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+            [encoder setComputePipelineState:g_softmax_bf16_pipeline];
+            [encoder setBuffer:bufScores offset:0 atIndex:0];
+            int total_rows = num_heads * seq_q;
+            [encoder setBytes:&total_rows length:sizeof(int) atIndex:1];
+            [encoder setBytes:&seq_k length:sizeof(int) atIndex:2];
+
+            NSUInteger threadsPerGroup = MIN(256, (NSUInteger)seq_k);
+            [encoder dispatchThreadgroups:MTLSizeMake(total_rows, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+            [encoder endEncoding];
+        }
+
+        /* Phase 3: scores @ V */
+        {
+            id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+            [encoder setComputePipelineState:g_bmm_bf16_sv_pipeline];
+            [encoder setBuffer:bufScores offset:0 atIndex:0];
+            [encoder setBuffer:V->buffer offset:0 atIndex:1];
+            [encoder setBuffer:out->buffer offset:0 atIndex:2];
+            [encoder setBytes:&seq_q length:sizeof(int) atIndex:3];
+            [encoder setBytes:&seq_k length:sizeof(int) atIndex:4];
+            [encoder setBytes:&head_dim length:sizeof(int) atIndex:5];
+            [encoder setBytes:&num_heads length:sizeof(int) atIndex:6];
+
+            uint TILE_SIZE = 16;
+            MTLSize threadsPerGroup = MTLSizeMake(TILE_SIZE, TILE_SIZE, 1);
+            MTLSize numGroups = MTLSizeMake(
+                (head_dim + TILE_SIZE - 1) / TILE_SIZE,
+                (seq_q + TILE_SIZE - 1) / TILE_SIZE,
+                num_heads);
+            [encoder dispatchThreadgroups:numGroups threadsPerThreadgroup:threadsPerGroup];
+            [encoder endEncoding];
+        }
+
+        out->has_pending_work = 1;
+        Q->has_pending_work = 1;
+        K->has_pending_work = 1;
+        V->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+            Q->has_pending_work = 0;
+            K->has_pending_work = 0;
+            V->has_pending_work = 0;
+        }
+
+        pool_release_buffer(bufScores);
+        return 1;
+    }
+}
+
+/* MPSGraph SDPA (bf16) for long sequences.
+ * Q/K/V expected in [seq, heads * head_dim] layout (bf16).
+ */
+static sdpa_graph_cache_t *get_sdpa_graph_cache(int seq_q, int seq_k, int num_heads,
+                                                int head_dim, float scale) {
+    if (!NSClassFromString(@"MPSGraph")) {
+        return NULL;
+    }
+
+    pthread_mutex_lock(&g_sdpa_graph_mutex);
+    for (int i = 0; i < g_sdpa_graph_count; i++) {
+        sdpa_graph_cache_t *entry = &g_sdpa_graph_cache[i];
+        if (entry->seq_q == seq_q && entry->seq_k == seq_k &&
+            entry->num_heads == num_heads && entry->head_dim == head_dim) {
+            pthread_mutex_unlock(&g_sdpa_graph_mutex);
+            return entry;
+        }
+    }
+
+    int slot = 0;
+    if (g_sdpa_graph_count < MAX_SDPA_GRAPH_CACHE) {
+        slot = g_sdpa_graph_count++;
+    }
+
+    sdpa_graph_cache_t *entry = &g_sdpa_graph_cache[slot];
+    entry->seq_q = seq_q;
+    entry->seq_k = seq_k;
+    entry->num_heads = num_heads;
+    entry->head_dim = head_dim;
+
+    @autoreleasepool {
+        MPSGraph *graph = [[MPSGraph alloc] init];
+        if (!graph) {
+            pthread_mutex_unlock(&g_sdpa_graph_mutex);
+            return NULL;
+        }
+
+        NSArray<NSNumber *> *qShape = @[@1, @(seq_q), @(num_heads), @(head_dim)];
+        NSArray<NSNumber *> *kShape = @[@1, @(seq_k), @(num_heads), @(head_dim)];
+        NSArray<NSNumber *> *vShape = @[@1, @(seq_k), @(num_heads), @(head_dim)];
+        NSArray<NSNumber *> *outShape = @[@1, @(seq_q), @(num_heads), @(head_dim)];
+
+        MPSGraphTensor *qIn = [graph placeholderWithShape:qShape dataType:MPSDataTypeBFloat16 name:nil];
+        MPSGraphTensor *kIn = [graph placeholderWithShape:kShape dataType:MPSDataTypeBFloat16 name:nil];
+        MPSGraphTensor *vIn = [graph placeholderWithShape:vShape dataType:MPSDataTypeBFloat16 name:nil];
+
+        /* Transpose to [1, heads, seq, head_dim] for matmul */
+        MPSGraphTensor *qT = [graph transposeTensor:qIn dimension:1 withDimension:2 name:nil];
+        MPSGraphTensor *kT = [graph transposeTensor:kIn dimension:1 withDimension:2 name:nil];
+        MPSGraphTensor *vT = [graph transposeTensor:vIn dimension:1 withDimension:2 name:nil];
+        MPSGraphTensor *kTT = [graph transposeTensor:kT dimension:2 withDimension:3 name:nil];
+
+        MPSGraphTensor *qk = [graph matrixMultiplicationWithPrimaryTensor:qT secondaryTensor:kTT name:nil];
+        MPSGraphTensor *qkF32 = [graph castTensor:qk toType:MPSDataTypeFloat32 name:nil];
+        MPSGraphTensor *scaleTensor = [graph constantWithScalar:scale
+                                                          shape:@[@1]
+                                                       dataType:MPSDataTypeFloat32];
+        MPSGraphTensor *scaled = [graph multiplicationWithPrimaryTensor:qkF32 secondaryTensor:scaleTensor name:nil];
+        MPSGraphTensor *sm = [graph softMaxWithTensor:scaled axis:3 name:nil];
+        MPSGraphTensor *out = [graph matrixMultiplicationWithPrimaryTensor:sm secondaryTensor:vT name:nil];
+        MPSGraphTensor *outCast = [graph castTensor:out toType:MPSDataTypeBFloat16 name:nil];
+        MPSGraphTensor *outTrans = [graph transposeTensor:outCast dimension:1 withDimension:2 name:nil];
+
+        entry->graph = graph;
+        entry->qTensor = qIn;
+        entry->kTensor = kIn;
+        entry->vTensor = vIn;
+        entry->outTensor = outTrans;
+        entry->qShape = qShape;
+        entry->kShape = kShape;
+        entry->vShape = vShape;
+        entry->outShape = outShape;
+    }
+
+    pthread_mutex_unlock(&g_sdpa_graph_mutex);
+    return entry;
+}
+
+static linear_graph_cache_t *get_linear_graph_cache(int seq_len, int in_dim, int out_dim) {
+    if (!NSClassFromString(@"MPSGraph")) {
+        return NULL;
+    }
+
+    pthread_mutex_lock(&g_linear_graph_mutex);
+    for (int i = 0; i < g_linear_graph_count; i++) {
+        linear_graph_cache_t *entry = &g_linear_graph_cache[i];
+        if (entry->seq == seq_len && entry->in_dim == in_dim && entry->out_dim == out_dim) {
+            pthread_mutex_unlock(&g_linear_graph_mutex);
+            return entry;
+        }
+    }
+
+    int slot = 0;
+    if (g_linear_graph_count < MAX_LINEAR_GRAPH_CACHE) {
+        slot = g_linear_graph_count++;
+    }
+
+    linear_graph_cache_t *entry = &g_linear_graph_cache[slot];
+    entry->seq = seq_len;
+    entry->in_dim = in_dim;
+    entry->out_dim = out_dim;
+
+    @autoreleasepool {
+        MPSGraph *graph = [[MPSGraph alloc] init];
+        if (!graph) {
+            pthread_mutex_unlock(&g_linear_graph_mutex);
+            return NULL;
+        }
+
+        NSArray<NSNumber *> *xShape = @[@1, @(seq_len), @(in_dim)];
+        NSArray<NSNumber *> *wShape = @[@1, @(out_dim), @(in_dim)];
+        NSArray<NSNumber *> *outShape = @[@1, @(seq_len), @(out_dim)];
+
+        MPSGraphTensor *xIn = [graph placeholderWithShape:xShape dataType:MPSDataTypeBFloat16 name:nil];
+        MPSGraphTensor *wIn = [graph placeholderWithShape:wShape dataType:MPSDataTypeBFloat16 name:nil];
+        MPSGraphTensor *wT = [graph transposeTensor:wIn dimension:1 withDimension:2 name:nil];
+        MPSGraphTensor *xF32 = [graph castTensor:xIn toType:MPSDataTypeFloat32 name:nil];
+        MPSGraphTensor *wTF32 = [graph castTensor:wT toType:MPSDataTypeFloat32 name:nil];
+        MPSGraphTensor *out = [graph matrixMultiplicationWithPrimaryTensor:xF32 secondaryTensor:wTF32 name:nil];
+        MPSGraphTensor *outCast = [graph castTensor:out toType:MPSDataTypeBFloat16 name:nil];
+
+        entry->graph = graph;
+        entry->xTensor = xIn;
+        entry->wTensor = wIn;
+        entry->outTensor = outCast;
+        entry->xShape = xShape;
+        entry->wShape = wShape;
+        entry->outShape = outShape;
+    }
+
+    pthread_mutex_unlock(&g_linear_graph_mutex);
+    return entry;
+}
+
+static int flux_gpu_attention_mpsgraph_bf16(flux_gpu_tensor_t out,
+                                            flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+                                            int seq_q, int seq_k, int num_heads, int head_dim, float scale) {
+    if (!g_initialized || !g_device) return 0;
+    if (!out || !Q || !K || !V) return 0;
+    if (!out->is_f16 || !Q->is_f16 || !K->is_f16 || !V->is_f16) return 0;
+
+    sdpa_graph_cache_t *cache = get_sdpa_graph_cache(seq_q, seq_k, num_heads, head_dim, scale);
+    if (!cache || !cache->graph) return 0;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        if (!cmdBuffer) return 0;
+        MPSCommandBuffer *mpsCmd = nil;
+        if (g_tensor_batch_mode) {
+            mpsCmd = [MPSCommandBuffer commandBufferWithCommandBuffer:cmdBuffer];
+        } else {
+            mpsCmd = [MPSCommandBuffer commandBufferFromCommandQueue:g_queue];
+        }
+        if (!mpsCmd) return 0;
+
+        MPSGraphTensorData *qData =
+            [[MPSGraphTensorData alloc] initWithMTLBuffer:Q->buffer
+                                                   shape:cache->qShape
+                                                dataType:MPSDataTypeBFloat16];
+        MPSGraphTensorData *kData =
+            [[MPSGraphTensorData alloc] initWithMTLBuffer:K->buffer
+                                                   shape:cache->kShape
+                                                dataType:MPSDataTypeBFloat16];
+        MPSGraphTensorData *vData =
+            [[MPSGraphTensorData alloc] initWithMTLBuffer:V->buffer
+                                                   shape:cache->vShape
+                                                dataType:MPSDataTypeBFloat16];
+        MPSGraphTensorData *outData =
+            [[MPSGraphTensorData alloc] initWithMTLBuffer:out->buffer
+                                                   shape:cache->outShape
+                                                dataType:MPSDataTypeBFloat16];
+
+        NSDictionary *feeds = @{
+            cache->qTensor : qData,
+            cache->kTensor : kData,
+            cache->vTensor : vData
+        };
+        NSDictionary *results = @{ cache->outTensor : outData };
+
+        @try {
+            [cache->graph encodeToCommandBuffer:mpsCmd
+                                          feeds:feeds
+                               targetOperations:nil
+                              resultsDictionary:results
+                            executionDescriptor:nil];
+        } @catch (NSException *exception) {
+            return 0;
+        }
+
+        out->has_pending_work = 1;
+        Q->has_pending_work = 1;
+        K->has_pending_work = 1;
+        V->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [mpsCmd commit];
+            [mpsCmd waitUntilCompleted];
+            out->has_pending_work = 0;
+            Q->has_pending_work = 0;
+            K->has_pending_work = 0;
+            V->has_pending_work = 0;
+        } else {
+            /* MPSGraph may commit-and-continue; update the live buffer. */
+            g_tensor_cmd = [mpsCmd rootCommandBuffer];
+        }
+
+        return 1;
+    }
+}
+
+/* Truly fused BF16 attention - no intermediate score storage.
+ * Uses the attention_fused_bf16 kernel which keeps all computation in threadgroup memory.
+ * Input: Q, K, V in [seq, heads*head_dim] layout (bf16)
+ * Output: [seq, heads*head_dim] (bf16)
+ * This keeps computation in threadgroup memory without materializing scores.
+ */
+int flux_gpu_attention_fused_bf16(flux_gpu_tensor_t out,
+                                   flux_gpu_tensor_t Q, flux_gpu_tensor_t K, flux_gpu_tensor_t V,
+                                   int seq_q, int seq_k, int num_heads, int head_dim, float scale) {
+    if (!g_shaders_initialized) return 0;
+    if (!out || !Q || !K || !V) return 0;
+    if (!out->is_f16 || !Q->is_f16 || !K->is_f16 || !V->is_f16) return 0;
+
+    const char *attn_mode = getenv("FLUX_BF16_ATTENTION");
+    int force_graph = (attn_mode && strcmp(attn_mode, "graph") == 0);
+    int force_fused = (attn_mode && strcmp(attn_mode, "fused") == 0);
+
+    int want_graph = force_graph || (!force_fused && seq_k > 1024);
+    if (want_graph) {
+        if (flux_gpu_attention_mpsgraph_bf16(out, Q, K, V, seq_q, seq_k, num_heads, head_dim, scale)) {
+            return 1;
+        }
+    }
+    if (!g_attention_fused_bf16_pipeline) {
+        if (bf16_debug_enabled()) {
+            fprintf(stderr, "[BF16] attention_fused_bf16 missing pipeline\n");
+        }
+        return 0;
+    }
+
+    /* Limit seq_k length to what the shader can handle (1024 for shared memory). */
+    if (seq_k > 1024) {
+        if (bf16_debug_enabled()) {
+            fprintf(stderr, "[BF16] attention_fused_bf16 seq_k=%d too large\n", seq_k);
+        }
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        if (bf16_debug_enabled()) {
+            fprintf(stderr, "[BF16] attention_fused_bf16 seq_q=%d seq_k=%d heads=%d head_dim=%d\n",
+                    seq_q, seq_k, num_heads, head_dim);
+        }
+
+        [encoder setComputePipelineState:g_attention_fused_bf16_pipeline];
+        [encoder setBuffer:Q->buffer offset:0 atIndex:0];
+        [encoder setBuffer:K->buffer offset:0 atIndex:1];
+        [encoder setBuffer:V->buffer offset:0 atIndex:2];
+        [encoder setBuffer:out->buffer offset:0 atIndex:3];
+        [encoder setBytes:&seq_q length:sizeof(int) atIndex:4];
+        [encoder setBytes:&seq_k length:sizeof(int) atIndex:5];
+        [encoder setBytes:&num_heads length:sizeof(int) atIndex:6];
+        [encoder setBytes:&head_dim length:sizeof(int) atIndex:7];
+        [encoder setBytes:&scale length:sizeof(float) atIndex:8];
+
+        /* Dispatch: one threadgroup per (query_pos, head) pair */
+        NSUInteger threadsPerGroup = MIN(256, (NSUInteger)seq_k);
+        [encoder dispatchThreadgroups:MTLSizeMake(seq_q, num_heads, 1)
+                threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+
+        [encoder endEncoding];
+
+        out->has_pending_work = 1;
+        Q->has_pending_work = 1;
+        K->has_pending_work = 1;
+        V->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+            Q->has_pending_work = 0;
+            K->has_pending_work = 0;
+            V->has_pending_work = 0;
+        }
+
+        return 1;
+    }
+}
+
+/* ========================================================================
+ * BF16 GPU Tensor Operations
+ * These operate on bf16 GPU tensors (is_f16 = 1) with f32 internal computation.
+ * ======================================================================== */
+
+/* BF16 AdaLN: out = (1 + scale) * layernorm(x) + shift */
+void flux_gpu_adaln_norm_bf16(flux_gpu_tensor_t out, flux_gpu_tensor_t x,
+                               flux_gpu_tensor_t shift_bf16, flux_gpu_tensor_t scale_bf16,
+                               int seq, int hidden, float eps) {
+    if (!g_shaders_initialized || !g_adaln_norm_bf16_pipeline) return;
+    if (!out || !x || !shift_bf16 || !scale_bf16) return;
+    if (!out->is_f16 || !x->is_f16 || !shift_bf16->is_f16 || !scale_bf16->is_f16) return;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_adaln_norm_bf16_pipeline];
+        [encoder setBuffer:x->buffer offset:0 atIndex:0];
+        [encoder setBuffer:shift_bf16->buffer offset:0 atIndex:1];
+        [encoder setBuffer:scale_bf16->buffer offset:0 atIndex:2];
+        [encoder setBuffer:out->buffer offset:0 atIndex:3];
+        [encoder setBytes:&hidden length:sizeof(int) atIndex:4];
+        [encoder setBytes:&eps length:sizeof(float) atIndex:5];
+
+        NSUInteger threadsPerGroup = MIN(256, (NSUInteger)hidden);
+        [encoder dispatchThreadgroups:MTLSizeMake(seq, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threadsPerGroup, 1, 1)];
+        [encoder endEncoding];
+
+        out->has_pending_work = 1;
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+        }
+    }
+}
+
+/* BF16 QK RMSNorm (in-place on bf16 tensors) */
+void flux_gpu_qk_rms_norm_bf16(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
+                                flux_gpu_tensor_t q_weight_bf16, flux_gpu_tensor_t k_weight_bf16,
+                                int seq, int heads, int head_dim, float eps) {
+    if (!g_shaders_initialized || !g_qk_rms_norm_bf16_pipeline) return;
+    if (!q || !k || !q_weight_bf16 || !k_weight_bf16) return;
+    if (!q->is_f16 || !k->is_f16) return;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_qk_rms_norm_bf16_pipeline];
+        [encoder setBuffer:q->buffer offset:0 atIndex:0];
+        [encoder setBuffer:k->buffer offset:0 atIndex:1];
+        [encoder setBuffer:q_weight_bf16->buffer offset:0 atIndex:2];
+        [encoder setBuffer:k_weight_bf16->buffer offset:0 atIndex:3];
+        [encoder setBytes:&heads length:sizeof(int) atIndex:4];
+        [encoder setBytes:&head_dim length:sizeof(int) atIndex:5];
+        [encoder setBytes:&eps length:sizeof(float) atIndex:6];
+
+        [encoder dispatchThreadgroups:MTLSizeMake(seq, heads, 1)
+                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [encoder endEncoding];
+
+        q->has_pending_work = 1;
+        k->has_pending_work = 1;
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            q->has_pending_work = 0;
+            k->has_pending_work = 0;
+        }
+    }
+}
+
+/* BF16 SiLU multiply: gate = silu(gate) * up */
+void flux_gpu_silu_mul_bf16(flux_gpu_tensor_t gate, flux_gpu_tensor_t up, int n) {
+    if (!g_shaders_initialized || !g_silu_mul_bf16_pipeline) return;
+    if (!gate || !up || !gate->is_f16 || !up->is_f16) return;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_silu_mul_bf16_pipeline];
+        [encoder setBuffer:gate->buffer offset:0 atIndex:0];
+        [encoder setBuffer:up->buffer offset:0 atIndex:1];
+        [encoder setBytes:&n length:sizeof(int) atIndex:2];
+
+        NSUInteger threads = 256;
+        NSUInteger groups = (n + threads - 1) / threads;
+        [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        [encoder endEncoding];
+
+        gate->has_pending_work = 1;
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            gate->has_pending_work = 0;
+        }
+    }
+}
+
+/* BF16 Gated add: out += gate * proj */
+void flux_gpu_gated_add_bf16(flux_gpu_tensor_t out, flux_gpu_tensor_t gate_bf16,
+                              flux_gpu_tensor_t proj, int seq, int hidden) {
+    if (!g_shaders_initialized || !g_gated_add_bf16_pipeline) return;
+    if (!out || !gate_bf16 || !proj) return;
+    if (!out->is_f16 || !gate_bf16->is_f16 || !proj->is_f16) return;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_gated_add_bf16_pipeline];
+        [encoder setBuffer:out->buffer offset:0 atIndex:0];
+        [encoder setBuffer:gate_bf16->buffer offset:0 atIndex:1];
+        [encoder setBuffer:proj->buffer offset:0 atIndex:2];
+        [encoder setBytes:&seq length:sizeof(int) atIndex:3];
+        [encoder setBytes:&hidden length:sizeof(int) atIndex:4];
+
+        [encoder dispatchThreadgroups:MTLSizeMake(seq, hidden, 1)
+                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [encoder endEncoding];
+
+        out->has_pending_work = 1;
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+        }
+    }
+}
+
+/* BF16 RoPE unified (text + image) */
+void flux_gpu_rope_unified_bf16(flux_gpu_tensor_t q, flux_gpu_tensor_t k,
+                                 const float *txt_cos, const float *txt_sin,
+                                 const float *img_cos, const float *img_sin,
+                                 int seq, int img_offset, int heads, int head_dim, int axis_dim) {
+    if (!g_shaders_initialized || !g_rope_unified_bf16_pipeline) return;
+    if (!q || !k || !q->is_f16 || !k->is_f16) return;
+
+    @autoreleasepool {
+        /* Get cached frequency buffers (f32 - frequencies don't need to be bf16) */
+        int txt_len = img_offset;
+        int img_len = seq - img_offset;
+        size_t txt_size = (size_t)txt_len * head_dim * sizeof(float);
+        size_t img_size = (size_t)img_len * head_dim * sizeof(float);
+
+        id<MTLBuffer> bufTxtCos = get_cached_weight_buffer(txt_cos, txt_size);
+        id<MTLBuffer> bufTxtSin = get_cached_weight_buffer(txt_sin, txt_size);
+        id<MTLBuffer> bufImgCos = get_cached_weight_buffer(img_cos, img_size);
+        id<MTLBuffer> bufImgSin = get_cached_weight_buffer(img_sin, img_size);
+
+        if (!bufTxtCos || !bufTxtSin || !bufImgCos || !bufImgSin) return;
+
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+
+        /* Apply RoPE to Q */
+        {
+            id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+            [encoder setComputePipelineState:g_rope_unified_bf16_pipeline];
+            [encoder setBuffer:q->buffer offset:0 atIndex:0];
+            [encoder setBuffer:bufTxtCos offset:0 atIndex:1];
+            [encoder setBuffer:bufTxtSin offset:0 atIndex:2];
+            [encoder setBuffer:bufImgCos offset:0 atIndex:3];
+            [encoder setBuffer:bufImgSin offset:0 atIndex:4];
+            [encoder setBytes:&seq length:sizeof(int) atIndex:5];
+            [encoder setBytes:&img_offset length:sizeof(int) atIndex:6];
+            [encoder setBytes:&heads length:sizeof(int) atIndex:7];
+            [encoder setBytes:&head_dim length:sizeof(int) atIndex:8];
+            [encoder setBytes:&axis_dim length:sizeof(int) atIndex:9];
+            [encoder dispatchThreadgroups:MTLSizeMake(seq, heads, 1)
+                    threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            [encoder endEncoding];
+        }
+
+        /* Apply RoPE to K */
+        {
+            id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+            [encoder setComputePipelineState:g_rope_unified_bf16_pipeline];
+            [encoder setBuffer:k->buffer offset:0 atIndex:0];
+            [encoder setBuffer:bufTxtCos offset:0 atIndex:1];
+            [encoder setBuffer:bufTxtSin offset:0 atIndex:2];
+            [encoder setBuffer:bufImgCos offset:0 atIndex:3];
+            [encoder setBuffer:bufImgSin offset:0 atIndex:4];
+            [encoder setBytes:&seq length:sizeof(int) atIndex:5];
+            [encoder setBytes:&img_offset length:sizeof(int) atIndex:6];
+            [encoder setBytes:&heads length:sizeof(int) atIndex:7];
+            [encoder setBytes:&head_dim length:sizeof(int) atIndex:8];
+            [encoder setBytes:&axis_dim length:sizeof(int) atIndex:9];
+            [encoder dispatchThreadgroups:MTLSizeMake(seq, heads, 1)
+                    threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            [encoder endEncoding];
+        }
+
+        q->has_pending_work = 1;
+        k->has_pending_work = 1;
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            q->has_pending_work = 0;
+            k->has_pending_work = 0;
+        }
+    }
+}
+
+/* BF16 RoPE 2D (single stream) */
+void flux_gpu_rope_2d_bf16(flux_gpu_tensor_t x,
+                            const float *cos_freq, const float *sin_freq,
+                            int seq, int heads, int head_dim, int axis_dim) {
+    if (!g_shaders_initialized || !g_rope_2d_bf16_pipeline) return;
+    if (!x || !x->is_f16) return;
+
+    @autoreleasepool {
+        size_t freq_size = (size_t)seq * head_dim * sizeof(float);
+        id<MTLBuffer> bufCos = get_cached_weight_buffer(cos_freq, freq_size);
+        id<MTLBuffer> bufSin = get_cached_weight_buffer(sin_freq, freq_size);
+        if (!bufCos || !bufSin) return;
+
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_rope_2d_bf16_pipeline];
+        [encoder setBuffer:x->buffer offset:0 atIndex:0];
+        [encoder setBuffer:bufCos offset:0 atIndex:1];
+        [encoder setBuffer:bufSin offset:0 atIndex:2];
+        [encoder setBytes:&seq length:sizeof(int) atIndex:3];
+        [encoder setBytes:&heads length:sizeof(int) atIndex:4];
+        [encoder setBytes:&head_dim length:sizeof(int) atIndex:5];
+        [encoder setBytes:&axis_dim length:sizeof(int) atIndex:6];
+        [encoder dispatchThreadgroups:MTLSizeMake(seq, heads, 1)
+                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [encoder endEncoding];
+
+        x->has_pending_work = 1;
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            x->has_pending_work = 0;
+        }
+    }
+}
+
+/* Concatenate two bf16 sequences along seq dimension */
+void flux_gpu_concat_seq_bf16(flux_gpu_tensor_t out,
+                               flux_gpu_tensor_t a, flux_gpu_tensor_t b,
+                               int seq_a, int seq_b, int hidden) {
+    if (!g_shaders_initialized || !g_concat_seq_bf16_pipeline) return;
+    if (!out || !a || !b) return;
+    if (!out->is_f16 || !a->is_f16 || !b->is_f16) return;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_concat_seq_bf16_pipeline];
+        [encoder setBuffer:a->buffer offset:0 atIndex:0];
+        [encoder setBuffer:b->buffer offset:0 atIndex:1];
+        [encoder setBuffer:out->buffer offset:0 atIndex:2];
+        [encoder setBytes:&seq_a length:sizeof(int) atIndex:3];
+        [encoder setBytes:&seq_b length:sizeof(int) atIndex:4];
+        [encoder setBytes:&hidden length:sizeof(int) atIndex:5];
+
+        int total_seq = seq_a + seq_b;
+        [encoder dispatchThreadgroups:MTLSizeMake(total_seq, hidden, 1)
+                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [encoder endEncoding];
+
+        out->has_pending_work = 1;
+        a->has_pending_work = 1;
+        b->has_pending_work = 1;
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+            a->has_pending_work = 0;
+            b->has_pending_work = 0;
+        }
+    }
+}
+
+/* Slice a bf16 sequence along seq dimension */
+void flux_gpu_slice_seq_bf16(flux_gpu_tensor_t out,
+                              flux_gpu_tensor_t in,
+                              int seq_out, int hidden, int start) {
+    if (!g_shaders_initialized || !g_slice_seq_bf16_pipeline) return;
+    if (!out || !in) return;
+    if (!out->is_f16 || !in->is_f16) return;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_slice_seq_bf16_pipeline];
+        [encoder setBuffer:in->buffer offset:0 atIndex:0];
+        [encoder setBuffer:out->buffer offset:0 atIndex:1];
+        [encoder setBytes:&seq_out length:sizeof(int) atIndex:2];
+        [encoder setBytes:&hidden length:sizeof(int) atIndex:3];
+        [encoder setBytes:&start length:sizeof(int) atIndex:4];
+
+        [encoder dispatchThreadgroups:MTLSizeMake(seq_out, hidden, 1)
+                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [encoder endEncoding];
+
+        out->has_pending_work = 1;
+        in->has_pending_work = 1;
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+            in->has_pending_work = 0;
+        }
+    }
+}
+
+/* Convert f32 GPU tensor to bf16 GPU tensor */
+flux_gpu_tensor_t flux_gpu_tensor_f32_to_bf16(flux_gpu_tensor_t f32_tensor) {
+    if (!g_shaders_initialized || !g_f32_to_bf16_pipeline) return NULL;
+    if (!f32_tensor || f32_tensor->is_f16) return NULL;
+
+    flux_gpu_tensor_t bf16_tensor = flux_gpu_tensor_alloc_f16(f32_tensor->num_elements);
+    if (!bf16_tensor) return NULL;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        int n = (int)f32_tensor->num_elements;
+        [encoder setComputePipelineState:g_f32_to_bf16_pipeline];
+        [encoder setBuffer:f32_tensor->buffer offset:0 atIndex:0];
+        [encoder setBuffer:bf16_tensor->buffer offset:0 atIndex:1];
+        [encoder setBytes:&n length:sizeof(int) atIndex:2];
+
+        NSUInteger threads = 256;
+        NSUInteger groups = (n + threads - 1) / threads;
+        [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        [encoder endEncoding];
+
+        bf16_tensor->has_pending_work = 1;
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            bf16_tensor->has_pending_work = 0;
+        }
+    }
+
+    return bf16_tensor;
+}
+
+/* Convert bf16 GPU tensor to f32 GPU tensor */
+flux_gpu_tensor_t flux_gpu_tensor_bf16_to_f32(flux_gpu_tensor_t bf16_tensor) {
+    if (!g_shaders_initialized || !g_bf16_to_f32_pipeline) return NULL;
+    if (!bf16_tensor || !bf16_tensor->is_f16) return NULL;
+
+    flux_gpu_tensor_t f32_tensor = flux_gpu_tensor_alloc(bf16_tensor->num_elements);
+    if (!f32_tensor) return NULL;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        int n = (int)bf16_tensor->num_elements;
+        [encoder setComputePipelineState:g_bf16_to_f32_pipeline];
+        [encoder setBuffer:bf16_tensor->buffer offset:0 atIndex:0];
+        [encoder setBuffer:f32_tensor->buffer offset:0 atIndex:1];
+        [encoder setBytes:&n length:sizeof(int) atIndex:2];
+
+        NSUInteger threads = 256;
+        NSUInteger groups = (n + threads - 1) / threads;
+        [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        [encoder endEncoding];
+
+        f32_tensor->has_pending_work = 1;
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            f32_tensor->has_pending_work = 0;
+        }
+    }
+
+    return f32_tensor;
+}
+
+/* BF16 linear layer: out = x @ W^T (all bf16)
+ * x: [seq, in_dim] bf16
+ * W: [out_dim, in_dim] bf16 (from model weights)
+ * out: [seq, out_dim] bf16
+ */
+static flux_gpu_tensor_t flux_gpu_linear_bf16_mpsgraph(flux_gpu_tensor_t x,
+                                                       const uint16_t *W_bf16,
+                                                       int seq_len, int in_dim, int out_dim) {
+    if (!g_initialized || !x || !W_bf16 || !x->is_f16) return NULL;
+
+    linear_graph_cache_t *cache = get_linear_graph_cache(seq_len, in_dim, out_dim);
+    if (!cache || !cache->graph) return NULL;
+
+    flux_gpu_tensor_t out = flux_gpu_tensor_alloc_f16((size_t)seq_len * out_dim);
+    if (!out) return NULL;
+
+    size_t numW = (size_t)out_dim * in_dim;
+    id<MTLBuffer> bufW = get_cached_bf16_buffer(W_bf16, numW);
+    if (!bufW) {
+        flux_gpu_tensor_free(out);
+        return NULL;
+    }
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        if (!cmdBuffer) {
+            flux_gpu_tensor_free(out);
+            return NULL;
+        }
+        MPSCommandBuffer *mpsCmd = nil;
+        if (g_tensor_batch_mode) {
+            mpsCmd = [MPSCommandBuffer commandBufferWithCommandBuffer:cmdBuffer];
+        } else {
+            mpsCmd = [MPSCommandBuffer commandBufferFromCommandQueue:g_queue];
+        }
+        if (!mpsCmd) {
+            flux_gpu_tensor_free(out);
+            return NULL;
+        }
+
+        MPSGraphTensorData *xData =
+            [[MPSGraphTensorData alloc] initWithMTLBuffer:x->buffer
+                                                   shape:cache->xShape
+                                                dataType:MPSDataTypeBFloat16];
+        MPSGraphTensorData *wData =
+            [[MPSGraphTensorData alloc] initWithMTLBuffer:bufW
+                                                   shape:cache->wShape
+                                                dataType:MPSDataTypeBFloat16];
+        MPSGraphTensorData *outData =
+            [[MPSGraphTensorData alloc] initWithMTLBuffer:out->buffer
+                                                   shape:cache->outShape
+                                                dataType:MPSDataTypeBFloat16];
+
+        NSDictionary *feeds = @{
+            cache->xTensor : xData,
+            cache->wTensor : wData
+        };
+        NSDictionary *results = @{ cache->outTensor : outData };
+
+        @try {
+            [cache->graph encodeToCommandBuffer:mpsCmd
+                                          feeds:feeds
+                               targetOperations:nil
+                              resultsDictionary:results
+                            executionDescriptor:nil];
+        } @catch (NSException *exception) {
+            flux_gpu_tensor_free(out);
+            return NULL;
+        }
+
+        out->has_pending_work = 1;
+        x->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [mpsCmd commit];
+            [mpsCmd waitUntilCompleted];
+            out->has_pending_work = 0;
+            x->has_pending_work = 0;
+        } else {
+            g_tensor_cmd = [mpsCmd rootCommandBuffer];
+        }
+    }
+
+    return out;
+}
+
+flux_gpu_tensor_t flux_gpu_linear_bf16_native(flux_gpu_tensor_t x,
+                                               const uint16_t *W_bf16,
+                                               int seq_len, int in_dim, int out_dim) {
+    if (!g_shaders_initialized || !x || !x->is_f16 || !W_bf16) return NULL;
+
+    if (bf16_linear_use_graph(seq_len, in_dim, out_dim)) {
+        flux_gpu_tensor_t graph_out = flux_gpu_linear_bf16_mpsgraph(x, W_bf16,
+                                                                    seq_len, in_dim, out_dim);
+        if (graph_out) {
+            return graph_out;
+        }
+    }
+
+    if (!g_linear_bf16_pipeline) return NULL;
+
+    flux_gpu_tensor_t out = flux_gpu_tensor_alloc_f16((size_t)seq_len * out_dim);
+    if (!out) return NULL;
+
+    @autoreleasepool {
+        /* Get cached bf16 weight buffer */
+        size_t numW = (size_t)out_dim * in_dim;
+        id<MTLBuffer> bufW = get_cached_bf16_buffer(W_bf16, numW);
+        if (!bufW) {
+            flux_gpu_tensor_free(out);
+            return NULL;
+        }
+
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_linear_bf16_pipeline];
+        [encoder setBuffer:x->buffer offset:0 atIndex:0];
+        [encoder setBuffer:bufW offset:0 atIndex:1];
+        [encoder setBuffer:out->buffer offset:0 atIndex:2];
+        [encoder setBytes:&seq_len length:sizeof(int) atIndex:3];
+        [encoder setBytes:&in_dim length:sizeof(int) atIndex:4];
+        [encoder setBytes:&out_dim length:sizeof(int) atIndex:5];
+
+        uint TILE_SIZE = 16;
+        MTLSize threadsPerGroup = MTLSizeMake(TILE_SIZE, TILE_SIZE, 1);
+        MTLSize numGroups = MTLSizeMake(
+            (out_dim + TILE_SIZE - 1) / TILE_SIZE,
+            (seq_len + TILE_SIZE - 1) / TILE_SIZE,
+            1);
+        [encoder dispatchThreadgroups:numGroups threadsPerThreadgroup:threadsPerGroup];
+        [encoder endEncoding];
+
+        out->has_pending_work = 1;
+        x->has_pending_work = 1;
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+            x->has_pending_work = 0;
+        }
+    }
+
+    return out;
+}
+
+/* BF16 Split QKV+MLP: split fused output into separate tensors */
+void flux_gpu_split_qkv_mlp_bf16(flux_gpu_tensor_t fused,
+                                  flux_gpu_tensor_t q, flux_gpu_tensor_t k, flux_gpu_tensor_t v,
+                                  flux_gpu_tensor_t gate, flux_gpu_tensor_t up,
+                                  int seq, int hidden, int mlp_hidden) {
+    if (!g_shaders_initialized || !g_split_qkv_mlp_bf16_pipeline) return;
+    if (!fused || !q || !k || !v || !gate || !up) return;
+    if (!fused->is_f16 || !q->is_f16 || !k->is_f16 || !v->is_f16 ||
+        !gate->is_f16 || !up->is_f16) return;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_split_qkv_mlp_bf16_pipeline];
+        [encoder setBuffer:fused->buffer offset:0 atIndex:0];
+        [encoder setBuffer:q->buffer offset:0 atIndex:1];
+        [encoder setBuffer:k->buffer offset:0 atIndex:2];
+        [encoder setBuffer:v->buffer offset:0 atIndex:3];
+        [encoder setBuffer:gate->buffer offset:0 atIndex:4];
+        [encoder setBuffer:up->buffer offset:0 atIndex:5];
+        [encoder setBytes:&seq length:sizeof(int) atIndex:6];
+        [encoder setBytes:&hidden length:sizeof(int) atIndex:7];
+        [encoder setBytes:&mlp_hidden length:sizeof(int) atIndex:8];
+
+        int max_dim = hidden > mlp_hidden ? hidden : mlp_hidden;
+        [encoder dispatchThreadgroups:MTLSizeMake(seq, max_dim, 1)
+                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [encoder endEncoding];
+
+        q->has_pending_work = 1;
+        k->has_pending_work = 1;
+        v->has_pending_work = 1;
+        gate->has_pending_work = 1;
+        up->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            q->has_pending_work = 0;
+            k->has_pending_work = 0;
+            v->has_pending_work = 0;
+            gate->has_pending_work = 0;
+            up->has_pending_work = 0;
+        }
+    }
+}
+
+/* BF16 Concat attention + MLP outputs */
+void flux_gpu_concat_attn_mlp_bf16(flux_gpu_tensor_t attn, flux_gpu_tensor_t mlp,
+                                    flux_gpu_tensor_t out, int seq, int hidden, int mlp_hidden) {
+    if (!g_shaders_initialized || !g_concat_attn_mlp_bf16_pipeline) return;
+    if (!attn || !mlp || !out) return;
+    if (!attn->is_f16 || !mlp->is_f16 || !out->is_f16) return;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_concat_attn_mlp_bf16_pipeline];
+        [encoder setBuffer:attn->buffer offset:0 atIndex:0];
+        [encoder setBuffer:mlp->buffer offset:0 atIndex:1];
+        [encoder setBuffer:out->buffer offset:0 atIndex:2];
+        [encoder setBytes:&seq length:sizeof(int) atIndex:3];
+        [encoder setBytes:&hidden length:sizeof(int) atIndex:4];
+        [encoder setBytes:&mlp_hidden length:sizeof(int) atIndex:5];
+
+        int max_dim = hidden > mlp_hidden ? hidden : mlp_hidden;
+        [encoder dispatchThreadgroups:MTLSizeMake(seq, max_dim, 1)
+                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [encoder endEncoding];
+
+        out->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+        }
+    }
+}
+
+/* BF16 Transpose for attention: [seq, heads*head_dim] -> [heads, seq, head_dim] */
+void flux_gpu_transpose_to_heads_bf16(flux_gpu_tensor_t in, flux_gpu_tensor_t out,
+                                       int seq, int heads, int head_dim) {
+    if (!g_shaders_initialized || !g_transpose_to_heads_bf16_pipeline) return;
+    if (!in || !out || !in->is_f16 || !out->is_f16) return;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_transpose_to_heads_bf16_pipeline];
+        [encoder setBuffer:in->buffer offset:0 atIndex:0];
+        [encoder setBuffer:out->buffer offset:0 atIndex:1];
+        [encoder setBytes:&seq length:sizeof(int) atIndex:2];
+        [encoder setBytes:&heads length:sizeof(int) atIndex:3];
+        [encoder setBytes:&head_dim length:sizeof(int) atIndex:4];
+
+        /* Dispatch: one thread per element */
+        [encoder dispatchThreadgroups:MTLSizeMake((head_dim + 7) / 8, (seq + 7) / 8, heads)
+                threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        [encoder endEncoding];
+
+        out->has_pending_work = 1;
+        in->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+            in->has_pending_work = 0;
+        }
+    }
+}
+
+/* BF16 Transpose for attention output: [heads, seq, head_dim] -> [seq, heads*head_dim] */
+void flux_gpu_transpose_from_heads_bf16(flux_gpu_tensor_t in, flux_gpu_tensor_t out,
+                                         int seq, int heads, int head_dim) {
+    if (!g_shaders_initialized || !g_transpose_from_heads_bf16_pipeline) return;
+    if (!in || !out || !in->is_f16 || !out->is_f16) return;
+
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
+        id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_transpose_from_heads_bf16_pipeline];
+        [encoder setBuffer:in->buffer offset:0 atIndex:0];
+        [encoder setBuffer:out->buffer offset:0 atIndex:1];
+        [encoder setBytes:&seq length:sizeof(int) atIndex:2];
+        [encoder setBytes:&heads length:sizeof(int) atIndex:3];
+        [encoder setBytes:&head_dim length:sizeof(int) atIndex:4];
+
+        /* Dispatch: one thread per element */
+        [encoder dispatchThreadgroups:MTLSizeMake((head_dim + 7) / 8, (seq + 7) / 8, heads)
+                threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        [encoder endEncoding];
+
+        out->has_pending_work = 1;
+        in->has_pending_work = 1;
+
+        if (!g_tensor_batch_mode) {
+            [cmdBuffer commit];
+            [cmdBuffer waitUntilCompleted];
+            out->has_pending_work = 0;
+            in->has_pending_work = 0;
+        }
     }
 }
 
