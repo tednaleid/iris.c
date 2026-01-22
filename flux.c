@@ -59,6 +59,7 @@ extern float *flux_sample_euler(void *transformer, void *text_encoder,
                                 float guidance_scale,
                                 void (*progress_callback)(int step, int total));
 extern float *flux_linear_schedule(int num_steps);
+extern float *flux_official_schedule(int num_steps, int image_seq_len);
 extern float *flux_init_noise(int batch, int channels, int h, int w, int64_t seed);
 
 /* ========================================================================
@@ -314,13 +315,14 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
     /* Compute latent dimensions */
     int latent_h = p.height / 16;
     int latent_w = p.width / 16;
+    int image_seq_len = latent_h * latent_w;
 
     /* Initialize noise */
     int64_t seed = (p.seed < 0) ? (int64_t)time(NULL) : p.seed;
     float *z = flux_init_noise(1, FLUX_LATENT_CHANNELS, latent_h, latent_w, seed);
 
-    /* Get schedule */
-    float *schedule = flux_linear_schedule(p.num_steps);
+    /* Get official FLUX.2 schedule (matches Python) */
+    float *schedule = flux_official_schedule(p.num_steps, image_seq_len);
 
     /* Sample */
     float *latent = flux_sample_euler(
@@ -358,9 +360,6 @@ flux_image *flux_generate(flux_ctx *ctx, const char *prompt,
 /* ========================================================================
  * Generation with Pre-computed Embeddings
  * ======================================================================== */
-
-/* Forward declaration for official schedule */
-extern float *flux_official_schedule(int num_steps, int image_seq_len);
 
 flux_image *flux_generate_with_embeddings(flux_ctx *ctx,
                                            const float *text_emb, int text_seq,
