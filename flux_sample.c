@@ -206,7 +206,7 @@ float *flux_sample_euler(void *transformer, void *text_encoder,
     /* Reset timing counters */
     flux_reset_timing();
     double total_denoising_start = get_time_ms();
-    double step_times[64];  /* Max 64 steps */
+    double step_times[FLUX_MAX_STEPS];
 
     for (int step = 0; step < num_steps; step++) {
         float t_curr = schedule[step];
@@ -310,7 +310,7 @@ float *flux_sample_euler_with_refs(void *transformer, void *text_encoder,
     /* Reset timing counters */
     flux_reset_timing();
     double total_denoising_start = get_time_ms();
-    double step_times[64];
+    double step_times[FLUX_MAX_STEPS];
 
     for (int step = 0; step < num_steps; step++) {
         float t_curr = schedule[step];

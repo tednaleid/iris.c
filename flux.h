@@ -55,6 +55,9 @@ extern "C" {
 #define FLUX_MAX_SEQ_LEN        512
 #define FLUX_VOCAB_HASH_SIZE    150001
 
+/* Sampling */
+#define FLUX_MAX_STEPS          256
+
 /* ========================================================================
  * Opaque Types
  * ======================================================================== */

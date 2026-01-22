@@ -354,8 +354,8 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Error: Height must be between 64 and 4096\n");
         return 1;
     }
-    if (params.num_steps < 1 || params.num_steps > 100) {
-        fprintf(stderr, "Error: Steps must be between 1 and 100\n");
+    if (params.num_steps < 1 || params.num_steps > FLUX_MAX_STEPS) {
+        fprintf(stderr, "Error: Steps must be between 1 and %d\n", FLUX_MAX_STEPS);
         return 1;
     }
     if (params.strength < 0.0f || params.strength > 1.0f) {
