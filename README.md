@@ -115,6 +115,37 @@ Each reference image is encoded separately and passed to the transformer with di
 
 You can specify up to 16 reference images with multiple `-i` flags. The prompt guides how the references are combined.
 
+### Interactive CLI Mode
+
+Start without `-p` to enter interactive mode:
+
+```bash
+./flux -d flux-klein-model
+```
+
+Generate images by typing prompts. Each image gets a `$N` reference ID:
+
+```
+flux> a red sports car
+Done -> /tmp/flux-.../image-0001.png (ref $0)
+
+flux> a tropical beach
+Done -> /tmp/flux-.../image-0002.png (ref $1)
+
+flux> $0 $1 combine them
+Generating 256x256 (multi-ref, 2 images)...
+Done -> /tmp/flux-.../image-0003.png (ref $2)
+```
+
+**Prompt syntax:**
+- `prompt` - text-to-image
+- `512x512 prompt` - set size inline
+- `$ prompt` - img2img with last image
+- `$N prompt` - img2img with reference $N
+- `$0 $3 prompt` - multi-reference (combine images)
+
+**Commands:** `!help`, `!save`, `!load`, `!seed`, `!size`, `!steps`, `!explore`, `!show`, `!quit`
+
 ### Command Line Options
 
 **Required:**
