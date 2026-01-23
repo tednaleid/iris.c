@@ -73,10 +73,10 @@ static cli_state state;
  * Reference Management ($N syntax)
  * ====================================================================== */
 
-/* Register a new image and return its $N id */
+/* Register a new image and return its $N id (starts from 1 to match image-0001.png) */
 static int ref_add(const char *path) {
-    int id = state.next_ref_id++;
-    int slot = id % CLI_MAX_REFS;
+    int id = ++state.next_ref_id;  /* Pre-increment: 1, 2, 3, ... */
+    int slot = (id - 1) % CLI_MAX_REFS;
     state.refs[slot].id = id;
     strncpy(state.refs[slot].path, path, CLI_MAX_PATH - 1);
     state.refs[slot].path[CLI_MAX_PATH - 1] = '\0';
@@ -85,10 +85,10 @@ static int ref_add(const char *path) {
 
 /* Lookup a reference by $N id. Returns path or NULL if not found. */
 static const char *ref_lookup(int id) {
-    if (id < 0 || id >= state.next_ref_id) return NULL;
+    if (id < 1 || id > state.next_ref_id) return NULL;
     /* Check if id is still in the circular buffer */
-    if (state.next_ref_id - id > CLI_MAX_REFS) return NULL;
-    int slot = id % CLI_MAX_REFS;
+    if (state.next_ref_id - id >= CLI_MAX_REFS) return NULL;
+    int slot = (id - 1) % CLI_MAX_REFS;
     if (state.refs[slot].id != id) return NULL;
     return state.refs[slot].path;
 }
@@ -234,10 +234,9 @@ static void display_image(const char *path) {
  * Generation
  * ====================================================================== */
 
-static int generate_image(const char *prompt, const char *ref_image) {
+static int generate_image(const char *prompt, const char *ref_image,
+                          int explicit_width, int explicit_height) {
     flux_params params = FLUX_PARAMS_DEFAULT;
-    params.width = state.width;
-    params.height = state.height;
     params.num_steps = state.steps;
 
     /* Determine seed */
@@ -258,10 +257,26 @@ static int generate_image(const char *prompt, const char *ref_image) {
             fprintf(stderr, "Error: Cannot load '%s'\n", ref_image);
             return -1;
         }
+        /* Use explicit size if provided, otherwise use reference image dimensions */
+        if (explicit_width > 0 && explicit_height > 0) {
+            params.width = explicit_width;
+            params.height = explicit_height;
+        } else {
+            params.width = ref->width;
+            params.height = ref->height;
+        }
         printf("Generating %dx%d (img2img)...\n", params.width, params.height);
         img = flux_img2img(state.ctx, prompt, ref, &params);
         flux_image_free(ref);
     } else {
+        /* Text-to-image: use explicit size if provided, otherwise state defaults */
+        if (explicit_width > 0 && explicit_height > 0) {
+            params.width = explicit_width;
+            params.height = explicit_height;
+        } else {
+            params.width = state.width;
+            params.height = state.height;
+        }
         printf("Generating %dx%d...\n", params.width, params.height);
         img = flux_generate(state.ctx, prompt, &params);
     }
@@ -287,10 +302,9 @@ static int generate_image(const char *prompt, const char *ref_image) {
     return 0;
 }
 
-static int generate_multiref(const char *prompt, const char **ref_paths, int num_refs) {
+static int generate_multiref(const char *prompt, const char **ref_paths, int num_refs,
+                             int explicit_width, int explicit_height) {
     flux_params params = FLUX_PARAMS_DEFAULT;
-    params.width = state.width;
-    params.height = state.height;
     params.num_steps = state.steps;
 
     /* Determine seed */
@@ -313,6 +327,15 @@ static int generate_multiref(const char *prompt, const char **ref_paths, int num
             free(refs);
             return -1;
         }
+    }
+
+    /* Use explicit size if provided, otherwise default to first reference image */
+    if (explicit_width > 0 && explicit_height > 0) {
+        params.width = explicit_width;
+        params.height = explicit_height;
+    } else {
+        params.width = refs[0]->width;
+        params.height = refs[0]->height;
     }
 
     printf("Generating %dx%d (multi-ref, %d images)...\n",
@@ -665,12 +688,13 @@ static int process_prompt(char *line) {
     }
 
     /* Check for inline size (beginning or end of prompt) */
-    int w, h;
-    char *extracted = extract_size_from_prompt(line, &w, &h);
+    int explicit_w = 0, explicit_h = 0;
+    char *extracted = extract_size_from_prompt(line, &explicit_w, &explicit_h);
     if (extracted) {
-        state.width = (w / 16) * 16;
-        state.height = (h / 16) * 16;
-        printf("Default size: %dx%d\n", state.width, state.height);
+        /* Align to 16 pixels */
+        explicit_w = (explicit_w / 16) * 16;
+        explicit_h = (explicit_h / 16) * 16;
+        printf("Size: %dx%d\n", explicit_w, explicit_h);
         line = extracted;
         prompt_to_free = extracted;
     }
@@ -683,12 +707,12 @@ static int process_prompt(char *line) {
 
     /* Generate based on number of references */
     if (num_refs == 0) {
-        generate_image(line, NULL);
+        generate_image(line, NULL, explicit_w, explicit_h);
     } else if (num_refs == 1) {
-        generate_image(line, ref_paths[0]);
+        generate_image(line, ref_paths[0], explicit_w, explicit_h);
     } else {
         /* Multi-reference generation */
-        generate_multiref(line, ref_paths, num_refs);
+        generate_multiref(line, ref_paths, num_refs, explicit_w, explicit_h);
     }
 
     free(prompt_to_free);
