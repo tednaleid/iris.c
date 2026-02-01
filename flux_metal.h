@@ -462,6 +462,13 @@ flux_gpu_tensor_t flux_gpu_linear_bf16_native(flux_gpu_tensor_t x,
                                                const uint16_t *W_bf16,
                                                int seq_len, int in_dim, int out_dim);
 
+/* BF16 native linear layer writing into a pre-allocated bf16 output tensor.
+ * Returns 1 on success, 0 on failure. */
+int flux_gpu_linear_bf16_native_into(flux_gpu_tensor_t out,
+                                     flux_gpu_tensor_t x,
+                                     const uint16_t *W_bf16,
+                                     int seq_len, int in_dim, int out_dim);
+
 /* BF16 Transpose for attention: [seq, heads*head_dim] -> [heads, seq, head_dim] */
 void flux_gpu_transpose_to_heads_bf16(flux_gpu_tensor_t in, flux_gpu_tensor_t out,
                                        int seq, int heads, int head_dim);

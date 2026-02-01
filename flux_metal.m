@@ -5145,45 +5145,49 @@ flux_gpu_tensor_t flux_gpu_tensor_bf16_to_f32(flux_gpu_tensor_t bf16_tensor) {
     return f32_tensor;
 }
 
-/* BF16 linear layer: out = x @ W^T (all bf16)
- * x: [seq, in_dim] bf16
- * W: [out_dim, in_dim] bf16 (from model weights)
- * out: [seq, out_dim] bf16
- */
-static flux_gpu_tensor_t flux_gpu_linear_bf16_mpsgraph(flux_gpu_tensor_t x,
-                                                       const uint16_t *W_bf16,
-                                                       int seq_len, int in_dim, int out_dim) {
-    if (!g_initialized || !x || !W_bf16 || !x->is_f16) return NULL;
-
-    linear_graph_cache_t *cache = get_linear_graph_cache(seq_len, in_dim, out_dim);
-    if (!cache || !cache->graph) return NULL;
+flux_gpu_tensor_t flux_gpu_linear_bf16_native(flux_gpu_tensor_t x,
+                                               const uint16_t *W_bf16,
+                                               int seq_len, int in_dim, int out_dim) {
+    if (!g_shaders_initialized || !x || !x->is_f16 || !W_bf16) return NULL;
 
     flux_gpu_tensor_t out = flux_gpu_tensor_alloc_f16((size_t)seq_len * out_dim);
     if (!out) return NULL;
 
-    size_t numW = (size_t)out_dim * in_dim;
-    id<MTLBuffer> bufW = get_cached_bf16_buffer(W_bf16, numW);
-    if (!bufW) {
+    if (!flux_gpu_linear_bf16_native_into(out, x, W_bf16, seq_len, in_dim, out_dim)) {
         flux_gpu_tensor_free(out);
         return NULL;
     }
 
+    return out;
+}
+
+/* MPSGraph bf16 linear writing into a pre-allocated bf16 output tensor. */
+static int flux_gpu_linear_bf16_mpsgraph_into(flux_gpu_tensor_t out,
+                                              flux_gpu_tensor_t x,
+                                              const uint16_t *W_bf16,
+                                              int seq_len, int in_dim, int out_dim) {
+    if (!g_initialized || !out || !x || !W_bf16) return 0;
+    if (!out->is_f16 || !x->is_f16) return 0;
+    if (out->num_elements != (size_t)seq_len * (size_t)out_dim) return 0;
+
+    linear_graph_cache_t *cache = get_linear_graph_cache(seq_len, in_dim, out_dim);
+    if (!cache || !cache->graph) return 0;
+
+    size_t numW = (size_t)out_dim * (size_t)in_dim;
+    id<MTLBuffer> bufW = get_cached_bf16_buffer(W_bf16, numW);
+    if (!bufW) return 0;
+
     @autoreleasepool {
         id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
-        if (!cmdBuffer) {
-            flux_gpu_tensor_free(out);
-            return NULL;
-        }
+        if (!cmdBuffer) return 0;
+
         MPSCommandBuffer *mpsCmd = nil;
         if (g_tensor_batch_mode) {
             mpsCmd = [MPSCommandBuffer commandBufferWithCommandBuffer:cmdBuffer];
         } else {
             mpsCmd = [MPSCommandBuffer commandBufferFromCommandQueue:g_queue];
         }
-        if (!mpsCmd) {
-            flux_gpu_tensor_free(out);
-            return NULL;
-        }
+        if (!mpsCmd) return 0;
 
         MPSGraphTensorData *xData =
             [[MPSGraphTensorData alloc] initWithMTLBuffer:x->buffer
@@ -5211,8 +5215,7 @@ static flux_gpu_tensor_t flux_gpu_linear_bf16_mpsgraph(flux_gpu_tensor_t x,
                               resultsDictionary:results
                             executionDescriptor:nil];
         } @catch (NSException *exception) {
-            flux_gpu_tensor_free(out);
-            return NULL;
+            return 0;
         }
 
         out->has_pending_work = 1;
@@ -5224,41 +5227,35 @@ static flux_gpu_tensor_t flux_gpu_linear_bf16_mpsgraph(flux_gpu_tensor_t x,
             out->has_pending_work = 0;
             x->has_pending_work = 0;
         } else {
+            /* MPSGraph may commit-and-continue; update the live buffer. */
             g_tensor_cmd = [mpsCmd rootCommandBuffer];
         }
     }
 
-    return out;
+    return 1;
 }
 
-flux_gpu_tensor_t flux_gpu_linear_bf16_native(flux_gpu_tensor_t x,
-                                               const uint16_t *W_bf16,
-                                               int seq_len, int in_dim, int out_dim) {
-    if (!g_shaders_initialized || !x || !x->is_f16 || !W_bf16) return NULL;
+int flux_gpu_linear_bf16_native_into(flux_gpu_tensor_t out,
+                                     flux_gpu_tensor_t x,
+                                     const uint16_t *W_bf16,
+                                     int seq_len, int in_dim, int out_dim) {
+    if (!g_shaders_initialized || !out || !x || !W_bf16) return 0;
+    if (!out->is_f16 || !x->is_f16) return 0;
+    if (out->num_elements != (size_t)seq_len * (size_t)out_dim) return 0;
 
-    /* MPSGraph linear is faster than our custom kernel. It supports batch mode
-     * by wrapping our command buffer with MPSCommandBuffer. */
+    /* MPSGraph linear is faster than our custom kernel. */
     if (bf16_linear_use_graph(seq_len, in_dim, out_dim)) {
-        flux_gpu_tensor_t graph_out = flux_gpu_linear_bf16_mpsgraph(x, W_bf16,
-                                                                    seq_len, in_dim, out_dim);
-        if (graph_out) {
-            return graph_out;
+        if (flux_gpu_linear_bf16_mpsgraph_into(out, x, W_bf16, seq_len, in_dim, out_dim)) {
+            return 1;
         }
     }
 
-    if (!g_linear_bf16_pipeline) return NULL;
-
-    flux_gpu_tensor_t out = flux_gpu_tensor_alloc_f16((size_t)seq_len * out_dim);
-    if (!out) return NULL;
+    if (!g_linear_bf16_pipeline) return 0;
 
     @autoreleasepool {
-        /* Get cached bf16 weight buffer */
-        size_t numW = (size_t)out_dim * in_dim;
+        size_t numW = (size_t)out_dim * (size_t)in_dim;
         id<MTLBuffer> bufW = get_cached_bf16_buffer(W_bf16, numW);
-        if (!bufW) {
-            flux_gpu_tensor_free(out);
-            return NULL;
-        }
+        if (!bufW) return 0;
 
         id<MTLCommandBuffer> cmdBuffer = get_tensor_cmd();
         id<MTLComputeCommandEncoder> encoder = [cmdBuffer computeCommandEncoder];
@@ -5290,7 +5287,7 @@ flux_gpu_tensor_t flux_gpu_linear_bf16_native(flux_gpu_tensor_t x,
         }
     }
 
-    return out;
+    return 1;
 }
 
 /* BF16 Split QKV+MLP: split fused output into separate tensors */

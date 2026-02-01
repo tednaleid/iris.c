@@ -2073,6 +2073,68 @@ cleanup:
  *
  * Returns 1 on success, 0 to fall back to f32 path.
  * ======================================================================== */
+typedef struct {
+    int seq;
+    int hidden;
+    int mlp_hidden;
+    int fused_dim;
+    flux_gpu_tensor_t norm;
+    flux_gpu_tensor_t fused;
+    flux_gpu_tensor_t q;
+    flux_gpu_tensor_t k;
+    flux_gpu_tensor_t v;
+    flux_gpu_tensor_t gate_mlp;
+    flux_gpu_tensor_t up;
+    flux_gpu_tensor_t attn_out;
+    flux_gpu_tensor_t concat;
+    flux_gpu_tensor_t proj_out;
+} single_block_bf16_scratch_t;
+
+static void single_block_bf16_scratch_free(single_block_bf16_scratch_t *s) {
+    if (!s) return;
+    if (s->norm) flux_gpu_tensor_free(s->norm);
+    if (s->fused) flux_gpu_tensor_free(s->fused);
+    if (s->q) flux_gpu_tensor_free(s->q);
+    if (s->k) flux_gpu_tensor_free(s->k);
+    if (s->v) flux_gpu_tensor_free(s->v);
+    if (s->gate_mlp) flux_gpu_tensor_free(s->gate_mlp);
+    if (s->up) flux_gpu_tensor_free(s->up);
+    if (s->attn_out) flux_gpu_tensor_free(s->attn_out);
+    if (s->concat) flux_gpu_tensor_free(s->concat);
+    if (s->proj_out) flux_gpu_tensor_free(s->proj_out);
+    memset(s, 0, sizeof(*s));
+}
+
+static int single_block_bf16_scratch_init(single_block_bf16_scratch_t *s,
+                                         int seq, int hidden, int mlp_hidden) {
+    if (!s || seq <= 0 || hidden <= 0 || mlp_hidden <= 0) return 0;
+    memset(s, 0, sizeof(*s));
+
+    s->seq = seq;
+    s->hidden = hidden;
+    s->mlp_hidden = mlp_hidden;
+    s->fused_dim = hidden * 3 + mlp_hidden * 2;
+
+    s->norm = flux_gpu_tensor_alloc_f16((size_t)seq * hidden);
+    s->fused = flux_gpu_tensor_alloc_f16((size_t)seq * s->fused_dim);
+    s->q = flux_gpu_tensor_alloc_f16((size_t)seq * hidden);
+    s->k = flux_gpu_tensor_alloc_f16((size_t)seq * hidden);
+    s->v = flux_gpu_tensor_alloc_f16((size_t)seq * hidden);
+    s->gate_mlp = flux_gpu_tensor_alloc_f16((size_t)seq * mlp_hidden);
+    s->up = flux_gpu_tensor_alloc_f16((size_t)seq * mlp_hidden);
+    s->attn_out = flux_gpu_tensor_alloc_f16((size_t)seq * hidden);
+    s->concat = flux_gpu_tensor_alloc_f16((size_t)seq * (hidden + mlp_hidden));
+    s->proj_out = flux_gpu_tensor_alloc_f16((size_t)seq * hidden);
+
+    if (!s->norm || !s->fused || !s->q || !s->k || !s->v ||
+        !s->gate_mlp || !s->up || !s->attn_out || !s->concat || !s->proj_out) {
+        single_block_bf16_scratch_free(s);
+        return 0;
+    }
+
+    return 1;
+}
+
 static int single_block_forward_bf16(flux_gpu_tensor_t hidden_gpu,
                                       const single_block_t *block,
                                       flux_gpu_tensor_t shift_bf16,
@@ -2082,7 +2144,8 @@ static int single_block_forward_bf16(flux_gpu_tensor_t hidden_gpu,
                                       flux_gpu_tensor_t norm_k_weight_bf16,
                                       const float *img_rope_cos, const float *img_rope_sin,
                                       const float *txt_rope_cos, const float *txt_rope_sin,
-                                      int seq, int img_offset, flux_transformer_t *tf) {
+                                      int seq, int img_offset, flux_transformer_t *tf,
+                                      single_block_bf16_scratch_t *scratch) {
     /* Check if bf16 pipeline is available */
     if (!flux_bf16_pipeline_available()) return 0;
     if (!hidden_gpu || !flux_gpu_tensor_is_f16(hidden_gpu)) return 0;
@@ -2096,144 +2159,92 @@ static int single_block_forward_bf16(flux_gpu_tensor_t hidden_gpu,
     float eps = 1e-6f;
     int axis_dim = 32;
 
-    /* === Allocate bf16 intermediate tensors === */
-    flux_gpu_tensor_t norm_gpu = flux_gpu_tensor_alloc_f16(seq * h_size);
-    flux_gpu_tensor_t q_gpu = flux_gpu_tensor_alloc_f16(seq * h_size);
-    flux_gpu_tensor_t k_gpu = flux_gpu_tensor_alloc_f16(seq * h_size);
-    flux_gpu_tensor_t v_gpu = flux_gpu_tensor_alloc_f16(seq * h_size);
-    flux_gpu_tensor_t gate_mlp_gpu = flux_gpu_tensor_alloc_f16(seq * mlp_hidden);
-    flux_gpu_tensor_t up_gpu = flux_gpu_tensor_alloc_f16(seq * mlp_hidden);
-    flux_gpu_tensor_t concat_gpu = flux_gpu_tensor_alloc_f16(seq * (h_size + mlp_hidden));
-    flux_gpu_tensor_t attn_out_gpu = NULL;  /* Will be assigned from attention output */
+    int own_tensors = (scratch == NULL);
 
-    if (!norm_gpu || !q_gpu || !k_gpu || !v_gpu ||
-        !gate_mlp_gpu || !up_gpu || !concat_gpu) {
-        /* Cleanup and fall back */
-        if (norm_gpu) flux_gpu_tensor_free(norm_gpu);
-        if (q_gpu) flux_gpu_tensor_free(q_gpu);
-        if (k_gpu) flux_gpu_tensor_free(k_gpu);
-        if (v_gpu) flux_gpu_tensor_free(v_gpu);
-        if (gate_mlp_gpu) flux_gpu_tensor_free(gate_mlp_gpu);
-        if (up_gpu) flux_gpu_tensor_free(up_gpu);
-        if (concat_gpu) flux_gpu_tensor_free(concat_gpu);
-        return 0;
+    /* Either reuse a scratch set (fast path) or allocate per-call (fallback). */
+    flux_gpu_tensor_t norm_gpu = NULL;
+    flux_gpu_tensor_t fused_result = NULL;
+    flux_gpu_tensor_t q_gpu = NULL;
+    flux_gpu_tensor_t k_gpu = NULL;
+    flux_gpu_tensor_t v_gpu = NULL;
+    flux_gpu_tensor_t gate_mlp_gpu = NULL;
+    flux_gpu_tensor_t up_gpu = NULL;
+    flux_gpu_tensor_t attn_out_gpu = NULL;
+    flux_gpu_tensor_t concat_gpu = NULL;
+    flux_gpu_tensor_t proj_out_gpu = NULL;
+
+    if (scratch) {
+        if (scratch->seq != seq || scratch->hidden != h_size ||
+            scratch->mlp_hidden != mlp_hidden || scratch->fused_dim != fused_dim) {
+            return 0;
+        }
+        norm_gpu = scratch->norm;
+        fused_result = scratch->fused;
+        q_gpu = scratch->q;
+        k_gpu = scratch->k;
+        v_gpu = scratch->v;
+        gate_mlp_gpu = scratch->gate_mlp;
+        up_gpu = scratch->up;
+        attn_out_gpu = scratch->attn_out;
+        concat_gpu = scratch->concat;
+        proj_out_gpu = scratch->proj_out;
+
+        if (!norm_gpu || !fused_result || !q_gpu || !k_gpu || !v_gpu ||
+            !gate_mlp_gpu || !up_gpu || !attn_out_gpu || !concat_gpu || !proj_out_gpu) {
+            return 0;
+        }
+    } else {
+        norm_gpu = flux_gpu_tensor_alloc_f16((size_t)seq * h_size);
+        q_gpu = flux_gpu_tensor_alloc_f16((size_t)seq * h_size);
+        k_gpu = flux_gpu_tensor_alloc_f16((size_t)seq * h_size);
+        v_gpu = flux_gpu_tensor_alloc_f16((size_t)seq * h_size);
+        gate_mlp_gpu = flux_gpu_tensor_alloc_f16((size_t)seq * mlp_hidden);
+        up_gpu = flux_gpu_tensor_alloc_f16((size_t)seq * mlp_hidden);
+        attn_out_gpu = flux_gpu_tensor_alloc_f16((size_t)seq * h_size);
+        concat_gpu = flux_gpu_tensor_alloc_f16((size_t)seq * (h_size + mlp_hidden));
+
+        if (!norm_gpu || !q_gpu || !k_gpu || !v_gpu ||
+            !gate_mlp_gpu || !up_gpu || !attn_out_gpu || !concat_gpu) {
+            goto cleanup;
+        }
     }
 
     /* === Phase 1: AdaLN normalization (bf16) === */
     flux_gpu_adaln_norm_bf16(norm_gpu, hidden_gpu, shift_bf16, scale_bf16, seq, h_size, eps);
 
     /* === Phase 2: Fused QKV + MLP projection (bf16 native) === */
-    flux_gpu_tensor_t fused_result = flux_gpu_linear_bf16_native(norm_gpu,
-                                                                  block->qkv_mlp_weight_bf16,
-                                                                  seq, h_size, fused_dim);
-    if (!fused_result) {
-        /* Fall back to f32 path */
-        flux_gpu_tensor_free(norm_gpu);
-        flux_gpu_tensor_free(q_gpu);
-        flux_gpu_tensor_free(k_gpu);
-        flux_gpu_tensor_free(v_gpu);
-        flux_gpu_tensor_free(gate_mlp_gpu);
-        flux_gpu_tensor_free(up_gpu);
-        flux_gpu_tensor_free(attn_out_gpu);
-        flux_gpu_tensor_free(concat_gpu);
-        return 0;
+    if (scratch) {
+        if (!flux_gpu_linear_bf16_native_into(fused_result, norm_gpu,
+                                              block->qkv_mlp_weight_bf16,
+                                              seq, h_size, fused_dim)) {
+            return 0;
+        }
+    } else {
+        fused_result = flux_gpu_linear_bf16_native(norm_gpu,
+                                                   block->qkv_mlp_weight_bf16,
+                                                   seq, h_size, fused_dim);
+        if (!fused_result) goto cleanup;
     }
 
     /* === Phase 3: Split fused output (bf16) === */
     flux_gpu_split_qkv_mlp_bf16(fused_result, q_gpu, k_gpu, v_gpu, gate_mlp_gpu, up_gpu,
-                                 seq, h_size, mlp_hidden);
+                                seq, h_size, mlp_hidden);
 
     /* === Phase 4: QK RMSNorm (bf16) === */
     flux_gpu_qk_rms_norm_bf16(q_gpu, k_gpu, norm_q_weight_bf16, norm_k_weight_bf16,
-                               seq, heads, head_dim, eps);
+                              seq, heads, head_dim, eps);
 
     /* === Phase 5: Apply unified RoPE (bf16 tensors, f32 frequencies) === */
     flux_gpu_rope_unified_bf16(q_gpu, k_gpu,
-                                txt_rope_cos, txt_rope_sin,
-                                img_rope_cos, img_rope_sin,
-                                seq, img_offset, heads, head_dim, axis_dim);
+                               txt_rope_cos, txt_rope_sin,
+                               img_rope_cos, img_rope_sin,
+                               seq, img_offset, heads, head_dim, axis_dim);
 
     /* === Phase 6: Self-attention (native bf16 fused SDPA) === */
-    /* Use fused bf16 attention kernel:
-     * bf16 I/O with f32 accumulation, no intermediate score storage. */
     float attn_scale = 1.0f / sqrtf((float)head_dim);
-
-    /* Allocate bf16 output tensor */
-    attn_out_gpu = flux_gpu_tensor_alloc_f16(seq * h_size);
-    if (!attn_out_gpu) {
-        flux_gpu_tensor_free(fused_result);
-        flux_gpu_tensor_free(norm_gpu);
-        flux_gpu_tensor_free(q_gpu);
-        flux_gpu_tensor_free(k_gpu);
-        flux_gpu_tensor_free(v_gpu);
-        flux_gpu_tensor_free(gate_mlp_gpu);
-        flux_gpu_tensor_free(up_gpu);
-        flux_gpu_tensor_free(concat_gpu);
-        return 0;
-    }
-
-    /* Try native fused bf16 attention first */
     if (!flux_gpu_attention_fused_bf16(attn_out_gpu, q_gpu, k_gpu, v_gpu,
-                                        seq, seq, heads, head_dim, attn_scale)) {
-        /* Fall back to f32 path for sequences > 1024 */
-        flux_gpu_tensor_t q_f32 = flux_gpu_tensor_bf16_to_f32(q_gpu);
-        flux_gpu_tensor_t k_f32 = flux_gpu_tensor_bf16_to_f32(k_gpu);
-        flux_gpu_tensor_t v_f32 = flux_gpu_tensor_bf16_to_f32(v_gpu);
-        flux_gpu_tensor_t attn_f32 = flux_gpu_tensor_alloc(seq * h_size);
-
-        if (!q_f32 || !k_f32 || !v_f32 || !attn_f32) {
-            if (q_f32) flux_gpu_tensor_free(q_f32);
-            if (k_f32) flux_gpu_tensor_free(k_f32);
-            if (v_f32) flux_gpu_tensor_free(v_f32);
-            if (attn_f32) flux_gpu_tensor_free(attn_f32);
-            flux_gpu_tensor_free(fused_result);
-            flux_gpu_tensor_free(norm_gpu);
-            flux_gpu_tensor_free(q_gpu);
-            flux_gpu_tensor_free(k_gpu);
-            flux_gpu_tensor_free(v_gpu);
-            flux_gpu_tensor_free(gate_mlp_gpu);
-            flux_gpu_tensor_free(up_gpu);
-            flux_gpu_tensor_free(attn_out_gpu);
-            flux_gpu_tensor_free(concat_gpu);
-            return 0;
-        }
-
-        flux_gpu_sync();
-        if (!flux_gpu_attention_fused(attn_f32, q_f32, k_f32, v_f32,
                                        seq, seq, heads, head_dim, attn_scale)) {
-            /* Fall back to CPU attention */
-            float *q_cpu = tf->single_q;
-            float *k_cpu = tf->single_k;
-            float *v_cpu = tf->single_v;
-            flux_gpu_tensor_read(q_f32, q_cpu);
-            flux_gpu_tensor_read(k_f32, k_cpu);
-            flux_gpu_tensor_read(v_f32, v_cpu);
-            float *attn_out_cpu = tf->single_attn_out;
-            mha_forward(attn_out_cpu, q_cpu, k_cpu, v_cpu, seq, heads, head_dim, tf);
-            flux_gpu_tensor_write(attn_f32, attn_out_cpu);
-        }
-        flux_gpu_sync();
-
-        /* Convert f32 attention output to bf16 */
-        flux_gpu_tensor_t attn_bf16 = flux_gpu_tensor_f32_to_bf16(attn_f32);
-        flux_gpu_tensor_free(q_f32);
-        flux_gpu_tensor_free(k_f32);
-        flux_gpu_tensor_free(v_f32);
-        flux_gpu_tensor_free(attn_f32);
-        flux_gpu_tensor_free(attn_out_gpu);
-        attn_out_gpu = attn_bf16;
-
-        if (!attn_out_gpu) {
-            flux_gpu_tensor_free(fused_result);
-            flux_gpu_tensor_free(norm_gpu);
-            flux_gpu_tensor_free(q_gpu);
-            flux_gpu_tensor_free(k_gpu);
-            flux_gpu_tensor_free(v_gpu);
-            flux_gpu_tensor_free(gate_mlp_gpu);
-            flux_gpu_tensor_free(up_gpu);
-            flux_gpu_tensor_free(concat_gpu);
-            return 0;
-        }
+        goto cleanup;
     }
 
     /* === Phase 7: SwiGLU (bf16) === */
@@ -2243,39 +2254,52 @@ static int single_block_forward_bf16(flux_gpu_tensor_t hidden_gpu,
     flux_gpu_concat_attn_mlp_bf16(attn_out_gpu, gate_mlp_gpu, concat_gpu, seq, h_size, mlp_hidden);
 
     /* === Phase 9: Final projection (bf16 native) === */
-    flux_gpu_tensor_t proj_out_gpu = flux_gpu_linear_bf16_native(concat_gpu,
-                                                                  block->proj_mlp_weight_bf16,
-                                                                  seq, h_size + mlp_hidden, h_size);
-    if (!proj_out_gpu) {
-        /* Fall back */
-        flux_gpu_tensor_free(fused_result);
-        flux_gpu_tensor_free(norm_gpu);
-        flux_gpu_tensor_free(q_gpu);
-        flux_gpu_tensor_free(k_gpu);
-        flux_gpu_tensor_free(v_gpu);
-        flux_gpu_tensor_free(gate_mlp_gpu);
-        flux_gpu_tensor_free(up_gpu);
-        flux_gpu_tensor_free(attn_out_gpu);
-        flux_gpu_tensor_free(concat_gpu);
-        return 0;
+    if (scratch) {
+        if (!flux_gpu_linear_bf16_native_into(proj_out_gpu, concat_gpu,
+                                              block->proj_mlp_weight_bf16,
+                                              seq, h_size + mlp_hidden, h_size)) {
+            return 0;
+        }
+    } else {
+        proj_out_gpu = flux_gpu_linear_bf16_native(concat_gpu,
+                                                   block->proj_mlp_weight_bf16,
+                                                   seq, h_size + mlp_hidden, h_size);
+        if (!proj_out_gpu) goto cleanup;
     }
 
     /* === Phase 10: Gated add residual (bf16) === */
     flux_gpu_gated_add_bf16(hidden_gpu, gate_bf16, proj_out_gpu, seq, h_size);
 
-    /* Cleanup */
-    flux_gpu_tensor_free(proj_out_gpu);
-    flux_gpu_tensor_free(fused_result);
-    flux_gpu_tensor_free(norm_gpu);
-    flux_gpu_tensor_free(q_gpu);
-    flux_gpu_tensor_free(k_gpu);
-    flux_gpu_tensor_free(v_gpu);
-    flux_gpu_tensor_free(gate_mlp_gpu);
-    flux_gpu_tensor_free(up_gpu);
-    flux_gpu_tensor_free(attn_out_gpu);
-    flux_gpu_tensor_free(concat_gpu);
+    if (!own_tensors) return 1;
 
+    /* Owned tensors: release intermediates before returning. */
+    if (norm_gpu) flux_gpu_tensor_free(norm_gpu);
+    if (fused_result) flux_gpu_tensor_free(fused_result);
+    if (q_gpu) flux_gpu_tensor_free(q_gpu);
+    if (k_gpu) flux_gpu_tensor_free(k_gpu);
+    if (v_gpu) flux_gpu_tensor_free(v_gpu);
+    if (gate_mlp_gpu) flux_gpu_tensor_free(gate_mlp_gpu);
+    if (up_gpu) flux_gpu_tensor_free(up_gpu);
+    if (attn_out_gpu) flux_gpu_tensor_free(attn_out_gpu);
+    if (concat_gpu) flux_gpu_tensor_free(concat_gpu);
+    if (proj_out_gpu) flux_gpu_tensor_free(proj_out_gpu);
     return 1;
+
+cleanup:
+    if (!own_tensors) return 0;
+
+    if (norm_gpu) flux_gpu_tensor_free(norm_gpu);
+    if (fused_result) flux_gpu_tensor_free(fused_result);
+    if (q_gpu) flux_gpu_tensor_free(q_gpu);
+    if (k_gpu) flux_gpu_tensor_free(k_gpu);
+    if (v_gpu) flux_gpu_tensor_free(v_gpu);
+    if (gate_mlp_gpu) flux_gpu_tensor_free(gate_mlp_gpu);
+    if (up_gpu) flux_gpu_tensor_free(up_gpu);
+    if (attn_out_gpu) flux_gpu_tensor_free(attn_out_gpu);
+    if (concat_gpu) flux_gpu_tensor_free(concat_gpu);
+    if (proj_out_gpu) flux_gpu_tensor_free(proj_out_gpu);
+
+    return 0;
 }
 
 static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
@@ -2448,6 +2472,15 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
         goto cleanup;
     }
 
+    /* Single block scratch buffers: re-used across all 20 blocks to avoid
+     * repeated large allocations/zeroing while in batch mode. */
+    single_block_bf16_scratch_t single_scratch;
+    int single_scratch_ok = single_block_bf16_scratch_init(&single_scratch, total_seq, hidden, mlp_hidden);
+    if (!single_scratch_ok) {
+        BF16_DEBUG("[BF16] failed to allocate single-block scratch tensors\n");
+        goto cleanup;
+    }
+
     /* Single-stream blocks - batch ALL blocks together for minimal sync overhead. */
     flux_gpu_batch_begin();
     for (int i = 0; i < tf->num_single_layers; i++) {
@@ -2464,11 +2497,12 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
                                        norm_q, norm_k,
                                        img_rope_cos, img_rope_sin,
                                        txt_rope_cos, txt_rope_sin,
-                                       total_seq, txt_seq, tf)) {
+                                       total_seq, txt_seq, tf, &single_scratch)) {
             if (norm_q) flux_gpu_tensor_free(norm_q);
             if (norm_k) flux_gpu_tensor_free(norm_k);
             BF16_DEBUG("[BF16] single block %d failed\n", i);
             flux_gpu_batch_end();
+            single_block_bf16_scratch_free(&single_scratch);
             goto cleanup;
         }
         flux_gpu_tensor_free(norm_q);
@@ -2482,6 +2516,7 @@ static float *flux_transformer_forward_bf16(flux_transformer_t *tf,
             flux_substep_callback(FLUX_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);
     }
     flux_gpu_batch_end();
+    single_block_bf16_scratch_free(&single_scratch);
     single_time = tf_get_time_ms() - single_start;
 
     /* Slice image portion for final layer */
@@ -2972,7 +3007,7 @@ float *flux_transformer_forward(flux_transformer_t *tf,
                                                        norm_q_bf16, norm_k_bf16,
                                                        img_rope_cos, img_rope_sin,
                                                        txt_rope_cos, txt_rope_sin,
-                                                       total_seq, txt_seq, tf)) {
+                                                       total_seq, txt_seq, tf, NULL)) {
                             bf16_path_ok = 0;
                             flux_gpu_batch_end();
                             /* Convert back to f32 for fallback */
