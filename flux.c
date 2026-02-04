@@ -488,6 +488,14 @@ flux_image *flux_generate_with_embeddings(flux_ctx *ctx,
         return NULL;
     }
 
+    /* This API only supports the distilled (non-CFG) sampler since the
+     * caller provides a single embedding.  Warn if used with a base model
+     * because results will be incorrect without CFG. */
+    if (!ctx->is_distilled) {
+        fprintf(stderr, "Warning: flux_generate_with_embeddings() does not "
+                        "support CFG. Use flux_generate() for base models.\n");
+    }
+
     /* Load transformer if not already loaded */
     if (!flux_load_transformer_if_needed(ctx)) {
         return NULL;
@@ -728,6 +736,7 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
     if (!flux_load_transformer_if_needed(ctx)) {
         free(text_emb);
         free(text_emb_uncond);
+        if (resized) flux_image_free(resized);
         return NULL;
     }
 
@@ -754,6 +763,7 @@ flux_image *flux_img2img(flux_ctx *ctx, const char *prompt,
 
     if (!img_latent) {
         free(text_emb);
+        free(text_emb_uncond);
         set_error("Failed to encode image");
         return NULL;
     }
@@ -935,6 +945,7 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
                 free(ref_data);
                 free(resized_imgs);
                 free(text_emb);
+                free(text_emb_uncond);
                 set_error("Failed to resize reference image");
                 return NULL;
             }
@@ -959,6 +970,7 @@ flux_image *flux_multiref(flux_ctx *ctx, const char *prompt,
             free(ref_data);
             free(resized_imgs);
             free(text_emb);
+            free(text_emb_uncond);
             set_error("Failed to encode reference image");
             return NULL;
         }

@@ -426,6 +426,14 @@ int main(int argc, char *argv[]) {
         flux_set_base_mode(ctx);
     }
 
+    /* Resolve auto-parameters now that we know the model type */
+    if (!steps_set || params.num_steps <= 0) {
+        params.num_steps = flux_is_distilled(ctx) ? 4 : 50;
+    }
+    if (params.guidance <= 0) {
+        params.guidance = flux_is_distilled(ctx) ? 1.0f : 4.0f;
+    }
+
     double load_time = timer_end();
     LOG_NORMAL(" done (%.1fs)\n", load_time);
     LOG_NORMAL("Model: %s\n", flux_model_info(ctx));

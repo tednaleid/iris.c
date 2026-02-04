@@ -440,7 +440,7 @@ static void cmd_help(void) {
     printf("  !load <filename>      Load image for img2img\n");
     printf("  !seed <n>             Set seed (-1 for random)\n");
     printf("  !size <W>x<H>         Set default size\n");
-    printf("  !steps <n>            Set sampling steps\n");
+    printf("  !steps <n>            Set sampling steps (0 = auto)\n");
     printf("  !guidance <n>         Set CFG guidance scale (0 = auto)\n");
     printf("  !explore <n> <prompt> Generate n thumbnail variations\n");
     printf("  !show                 Toggle terminal display\n");
@@ -579,8 +579,14 @@ static void cmd_steps(char *arg) {
     }
 
     int val = atoi(arg);
+    if (val == 0) {
+        /* Reset to model default */
+        state.steps = flux_is_distilled(state.ctx) ? 4 : 50;
+        printf("Steps: %d (auto)\n", state.steps);
+        return;
+    }
     if (val < 1 || val > 256) {
-        fprintf(stderr, "Error: Steps must be 1-256.\n");
+        fprintf(stderr, "Error: Steps must be 0-256 (0 = auto).\n");
         return;
     }
     state.steps = val;
