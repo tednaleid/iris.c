@@ -39,7 +39,7 @@ If you want to try the 9B model (higher quality, non-commercial license, ~30GB d
 # 2. Get your token from https://huggingface.co/settings/tokens
 ./download_model.sh 9b --token YOUR_TOKEN
 # or: python download_model.py 9b --token YOUR_TOKEN
-# or: set HF_TOKEN env var, or save token to hf_token.txt
+# or: set HF_TOKEN env var
 ./flux -d flux-klein-9b -p "A woman wearing sunglasses" -o output.png
 ```
 
@@ -334,8 +334,7 @@ Download model weights from HuggingFace using one of these methods:
 ./download_model.sh 9b --token YOUR_TOKEN       # distilled
 ./download_model.sh 9b-base --token YOUR_TOKEN   # base (CFG, highest quality)
 # or: python download_model.py 9b --token YOUR_TOKEN
-# You can also set the HF_TOKEN environment variable or save
-# the token to hf_token.txt in the repo root.
+# You can also set the HF_TOKEN environment variable
 ```
 
 | Model | Directory | Size | Components |

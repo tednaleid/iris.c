@@ -72,12 +72,9 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-# Try to find token from environment or file
+# Try to find token from environment
 if [ -z "$TOKEN" ] && [ -n "$HF_TOKEN" ]; then
     TOKEN="$HF_TOKEN"
-fi
-if [ -z "$TOKEN" ] && [ -f "hf_token.txt" ]; then
-    TOKEN=$(cat hf_token.txt | tr -d '[:space:]')
 fi
 
 if [ -n "$TOKEN" ]; then
@@ -106,7 +103,7 @@ dl() {
             echo "  1. Accept the license at https://huggingface.co/black-forest-labs/$REPO"
             echo "  2. Get your token from https://huggingface.co/settings/tokens"
             echo "  3. Run: $0 $MODEL --token YOUR_TOKEN"
-            echo "  Or set HF_TOKEN env var, or save token to hf_token.txt"
+            echo "  Or set the HF_TOKEN env var"
         else
             echo "Authentication failed (HTTP 403). Possible causes:"
             echo "  - Token may be invalid or expired"

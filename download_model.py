@@ -73,15 +73,11 @@ def main():
         print("Install with: pip install huggingface_hub")
         return 1
 
-    # Determine token: CLI arg > env var > hf_token.txt file
+    # Determine token: CLI arg > env var
     token = args.token
     if not token:
         import os
         token = os.environ.get('HF_TOKEN')
-    if not token:
-        token_file = Path('hf_token.txt')
-        if token_file.exists():
-            token = token_file.read_text().strip()
 
     repo_id, default_dir = MODELS[args.model]
     output_dir = Path(args.output_dir if args.output_dir else default_dir)
@@ -159,7 +155,7 @@ def main():
                   repo_id.split('/')[-1])
             print("  2. Get your token from https://huggingface.co/settings/tokens")
             print(f"  3. Run: python download_model.py {args.model} --token YOUR_TOKEN")
-            print("  Or set HF_TOKEN env var, or save token to hf_token.txt")
+            print("  Or set the HF_TOKEN env var")
         else:
             print("If you need to authenticate, run:")
             print("  huggingface-cli login")
