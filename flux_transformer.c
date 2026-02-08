@@ -29,6 +29,45 @@ extern double flux_timing_transformer_double;
 extern double flux_timing_transformer_single;
 extern double flux_timing_transformer_final;
 
+/* Fine-grained profiling for BLAS optimization */
+static double prof_single_adaln = 0;
+static double prof_single_fused_matmul = 0;
+static double prof_single_split = 0;
+static double prof_single_qknorm_rope = 0;
+static double prof_single_attention = 0;
+static double prof_single_swiglu = 0;
+static double prof_single_proj_matmul = 0;
+static double prof_single_gated_add = 0;
+
+static double prof_get_time(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+}
+
+void flux_print_blas_profile(void) {
+    double total = prof_single_adaln + prof_single_fused_matmul + prof_single_split +
+                   prof_single_qknorm_rope + prof_single_attention + prof_single_swiglu +
+                   prof_single_proj_matmul + prof_single_gated_add;
+    if (total < 1.0) return;
+    fprintf(stderr, "\nSingle block breakdown (cumulative):\n");
+    fprintf(stderr, "  AdaLN+mod:     %7.1fms (%4.1f%%)\n", prof_single_adaln, 100*prof_single_adaln/total);
+    fprintf(stderr, "  Fused QKV+MLP: %7.1fms (%4.1f%%)\n", prof_single_fused_matmul, 100*prof_single_fused_matmul/total);
+    fprintf(stderr, "  Split:         %7.1fms (%4.1f%%)\n", prof_single_split, 100*prof_single_split/total);
+    fprintf(stderr, "  QKnorm+RoPE:   %7.1fms (%4.1f%%)\n", prof_single_qknorm_rope, 100*prof_single_qknorm_rope/total);
+    fprintf(stderr, "  Attention:     %7.1fms (%4.1f%%)\n", prof_single_attention, 100*prof_single_attention/total);
+    fprintf(stderr, "  SwiGLU:        %7.1fms (%4.1f%%)\n", prof_single_swiglu, 100*prof_single_swiglu/total);
+    fprintf(stderr, "  Proj matmul:   %7.1fms (%4.1f%%)\n", prof_single_proj_matmul, 100*prof_single_proj_matmul/total);
+    fprintf(stderr, "  Gated add:     %7.1fms (%4.1f%%)\n", prof_single_gated_add, 100*prof_single_gated_add/total);
+    fprintf(stderr, "  Total:         %7.1fms\n", total);
+}
+
+void flux_reset_blas_profile(void) {
+    prof_single_adaln = prof_single_fused_matmul = prof_single_split = 0;
+    prof_single_qknorm_rope = prof_single_attention = prof_single_swiglu = 0;
+    prof_single_proj_matmul = prof_single_gated_add = 0;
+}
+
 /* Helper to get current time in ms (wall-clock) */
 static double tf_get_time_ms(void) {
     struct timeval tv;
@@ -486,6 +525,16 @@ static void free_single_block_weights(single_block_t *b) {
     /* bf16 pointers are direct mmap pointers - just clear, don't free */
     b->qkv_mlp_weight_bf16 = NULL;
     b->proj_mlp_weight_bf16 = NULL;
+}
+
+/* Free cached mmap weights for all blocks.
+ * Called after denoising completes to release memory held across steps. */
+void flux_transformer_free_mmap_cache(flux_transformer_t *tf) {
+    if (!tf || !tf->use_mmap) return;
+    for (int i = 0; i < tf->num_double_layers; i++)
+        free_double_block_weights(&tf->double_blocks[i]);
+    for (int i = 0; i < tf->num_single_layers; i++)
+        free_single_block_weights(&tf->single_blocks[i]);
 }
 
 #ifdef USE_METAL
@@ -1283,45 +1332,35 @@ static void mha_forward(float *out, const float *q, const float *k, const float 
 
     /* CPU fallback: Use BLAS-optimized attention (faster) or flash attention (memory-efficient) */
 #ifdef USE_BLAS
-    /* BLAS path: transpose + batched matrix multiply per head */
+    /* BLAS path: strided per-head attention without transposes.
+     * Q, K, V are [seq, heads*head_dim] layout. We use lda=hidden to stride
+     * over heads, reading head_dim elements per row directly. */
     {
-        float *q_t = tf->attn_q_t;
-        float *k_t = tf->attn_k_t;
-        float *v_t = tf->attn_v_t;
-        float *out_t = tf->attn_out_t;
+        int hidden = tf->num_heads * head_dim;
         float *scores = tf->attn_scores;
 
-        /* Transpose to [heads, seq, head_dim] for efficient BLAS operations */
-        transpose_shd_to_hsd(q_t, q, seq, tf->num_heads, head_dim);
-        transpose_shd_to_hsd(k_t, k, seq, tf->num_heads, head_dim);
-        transpose_shd_to_hsd(v_t, v, seq, tf->num_heads, head_dim);
-
-        /* Process each head with BLAS */
         for (int h = 0; h < tf->num_heads; h++) {
-            float *qh = q_t + h * seq * head_dim;
-            float *kh = k_t + h * seq * head_dim;
-            float *vh = v_t + h * seq * head_dim;
-            float *oh = out_t + h * seq * head_dim;
+            const float *qh = q + h * head_dim;
+            const float *kh = k + h * head_dim;
+            const float *vh = v + h * head_dim;
+            float *oh = out + h * head_dim;
             float *sh = scores + h * seq * seq;
 
-            /* scores = Q @ K^T using BLAS */
+            /* scores = Q_h @ K_h^T, strided reads with lda=hidden */
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         seq, seq, head_dim,
-                        scale, qh, head_dim, kh, head_dim,
+                        scale, qh, hidden, kh, hidden,
                         0.0f, sh, seq);
 
-            /* Softmax */
+            /* Softmax over scores */
             flux_softmax(sh, seq, seq);
 
-            /* out = scores @ V using BLAS */
+            /* out_h = scores @ V_h, strided read and write */
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                         seq, head_dim, seq,
-                        1.0f, sh, seq, vh, head_dim,
-                        0.0f, oh, head_dim);
+                        1.0f, sh, seq, vh, hidden,
+                        0.0f, oh, hidden);
         }
-
-        /* Transpose output back to [seq, heads, head_dim] */
-        transpose_hsd_to_shd(out, out_t, seq, tf->num_heads, head_dim);
     }
 #else
     /* Generic fallback: Use flash attention (memory-efficient, no transpose needed) */
@@ -1396,59 +1435,43 @@ static void joint_attention(float *img_out, float *txt_out,
 
     /* CPU fallback: Use BLAS-optimized attention (faster) or flash attention (memory-efficient) */
 #ifdef USE_BLAS
-    /* BLAS path: transpose + batched matrix multiply per head */
+    /* BLAS path: strided per-head attention without transposes.
+     * All tensors are [seq, heads*head_dim] layout, use lda=hidden for strides. */
     {
-        float *img_q_t = tf->attn_q_t;
-        float *txt_q_t = tf->attn_q_t + img_seq * hidden;
-        float *cat_k_t = tf->attn_k_t;
-        float *cat_v_t = tf->attn_v_t;
-        float *img_out_t = tf->attn_out_t;
-        float *txt_out_t = tf->attn_out_t + img_seq * hidden;
         float *scores = tf->attn_scores;
 
-        /* Transpose to [heads, seq, head_dim] for efficient BLAS operations */
-        transpose_shd_to_hsd(img_q_t, img_q, img_seq, heads, head_dim);
-        transpose_shd_to_hsd(txt_q_t, txt_q, txt_seq, heads, head_dim);
-        transpose_shd_to_hsd(cat_k_t, cat_k, total_seq, heads, head_dim);
-        transpose_shd_to_hsd(cat_v_t, cat_v, total_seq, heads, head_dim);
-
-        /* Process each head with BLAS */
         for (int h = 0; h < heads; h++) {
-            float *img_qh = img_q_t + h * img_seq * head_dim;
-            float *txt_qh = txt_q_t + h * txt_seq * head_dim;
-            float *kh = cat_k_t + h * total_seq * head_dim;
-            float *vh = cat_v_t + h * total_seq * head_dim;
-            float *img_oh = img_out_t + h * img_seq * head_dim;
-            float *txt_oh = txt_out_t + h * txt_seq * head_dim;
+            const float *img_qh = img_q + h * head_dim;
+            const float *txt_qh = txt_q + h * head_dim;
+            const float *kh = cat_k + h * head_dim;
+            const float *vh = cat_v + h * head_dim;
+            float *img_oh = img_out + h * head_dim;
+            float *txt_oh = txt_out + h * head_dim;
             float *img_sh = scores;  /* Reuse scores buffer */
             float *txt_sh = scores + img_seq * total_seq;
 
             /* Image attention: img_Q @ cat_K^T */
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         img_seq, total_seq, head_dim,
-                        scale, img_qh, head_dim, kh, head_dim,
+                        scale, img_qh, hidden, kh, hidden,
                         0.0f, img_sh, total_seq);
             flux_softmax(img_sh, img_seq, total_seq);
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                         img_seq, head_dim, total_seq,
-                        1.0f, img_sh, total_seq, vh, head_dim,
-                        0.0f, img_oh, head_dim);
+                        1.0f, img_sh, total_seq, vh, hidden,
+                        0.0f, img_oh, hidden);
 
             /* Text attention: txt_Q @ cat_K^T */
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         txt_seq, total_seq, head_dim,
-                        scale, txt_qh, head_dim, kh, head_dim,
+                        scale, txt_qh, hidden, kh, hidden,
                         0.0f, txt_sh, total_seq);
             flux_softmax(txt_sh, txt_seq, total_seq);
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                         txt_seq, head_dim, total_seq,
-                        1.0f, txt_sh, total_seq, vh, head_dim,
-                        0.0f, txt_oh, head_dim);
+                        1.0f, txt_sh, total_seq, vh, hidden,
+                        0.0f, txt_oh, hidden);
         }
-
-        /* Transpose outputs back */
-        transpose_hsd_to_shd(img_out, img_out_t, img_seq, heads, head_dim);
-        transpose_hsd_to_shd(txt_out, txt_out_t, txt_seq, heads, head_dim);
     }
 #else
     /* Generic fallback: Use flash attention (memory-efficient, no transpose needed) */
@@ -3010,6 +3033,7 @@ static void single_block_forward(float *hidden, const single_block_t *block,
      * FLUX applies SiLU to t_emb before the modulation projection
      */
     int mod_size = h_size * 3;
+    double _t0 = prof_get_time();
 
     /* Apply SiLU to t_emb for modulation - use pre-allocated buffer */
     float *t_emb_silu = tf->t_emb_silu;
@@ -3030,6 +3054,8 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     /* Norm */
     float *norm = tf->work1;
     apply_adaln(norm, hidden, shift, scale, seq, h_size, eps);
+    double _t1 = prof_get_time();
+    prof_single_adaln += _t1 - _t0;
 
     /* Fused QKV + FFN input projection
      * Output: [seq, fused_dim] where fused_dim = [Q, K, V, gate, up]
@@ -3038,6 +3064,8 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     float *fused_out = tf->work2;
     LINEAR_BF16_OR_F32(fused_out, norm, block->qkv_mlp_weight, block->qkv_mlp_weight_bf16,
                        seq, h_size, fused_dim);
+    double _t2 = prof_get_time();
+    prof_single_fused_matmul += _t2 - _t1;
 
     /* Split outputs: use pre-allocated buffers
      * Each position has [Q, K, V, gate, up] concatenated
@@ -3056,6 +3084,9 @@ static void single_block_forward(float *hidden, const single_block_t *block,
         memcpy(mlp_gate + s * mlp_hidden, row + h_size * 3, mlp_hidden * sizeof(float));
         memcpy(mlp_up + s * mlp_hidden, row + h_size * 3 + mlp_hidden, mlp_hidden * sizeof(float));
     }
+
+    double _t3 = prof_get_time();
+    prof_single_split += _t3 - _t2;
 
     /* Apply QK normalization */
     apply_qk_norm(q, k, block->norm_q_weight, block->norm_k_weight,
@@ -3078,13 +3109,21 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     apply_rope_2d(img_q, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, axis_dim);
     apply_rope_2d(img_k, img_rope_cos, img_rope_sin, img_seq, heads, head_dim, axis_dim);
 
+    double _t4 = prof_get_time();
+    prof_single_qknorm_rope += _t4 - _t3;
+
     /* Self-attention - use pre-allocated buffer */
     float *attn_out = tf->single_attn_out;
     mha_forward(attn_out, q, k, v, seq, heads, head_dim, tf);
+    double _t5 = prof_get_time();
+    prof_single_attention += _t5 - _t4;
 
     /* SwiGLU: silu(gate) * up */
     flux_silu(mlp_gate, seq * mlp_hidden);
     flux_mul_inplace(mlp_gate, mlp_up, seq * mlp_hidden);
+
+    double _t6 = prof_get_time();
+    prof_single_swiglu += _t6 - _t5;
 
     /* Fused output projection: [attn_out, mlp_out] -> hidden
      * proj_mlp_weight: [hidden, hidden + mlp_hidden]
@@ -3102,8 +3141,13 @@ static void single_block_forward(float *hidden, const single_block_t *block,
     LINEAR_BF16_OR_F32(proj_out, concat, block->proj_mlp_weight, block->proj_mlp_weight_bf16,
                        seq, h_size + mlp_hidden, h_size);
 
+    double _t7 = prof_get_time();
+    prof_single_proj_matmul += _t7 - _t6;
+
     /* Apply gate and add residual - use vectorized helper */
     gated_add(hidden, gate, proj_out, seq, h_size);
+    double _t8 = prof_get_time();
+    prof_single_gated_add += _t8 - _t7;
 
     /* No free - using pre-allocated buffers */
 }
@@ -3234,8 +3278,9 @@ float *flux_transformer_forward(flux_transformer_t *tf,
                        1, hidden, double_mod_size);
 
     for (int i = 0; i < tf->num_double_layers; i++) {
-        /* In mmap mode, load block weights on-demand */
-        if (tf->use_mmap) {
+        /* In mmap mode, load block weights on-demand (cached across steps) */
+        if (tf->use_mmap && tf->double_blocks[i].img_q_weight == NULL
+                         && tf->double_blocks[i].img_q_weight_bf16 == NULL) {
             load_double_block_weights(&tf->double_blocks[i], tf->sf, i,
                                       tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
         }
@@ -3245,11 +3290,6 @@ float *flux_transformer_forward(flux_transformer_t *tf,
                              img_rope_cos, img_rope_sin,
                              txt_rope_cos, txt_rope_sin,
                              img_seq, txt_seq, tf);
-        /* In mmap mode, free block weights after use */
-        if (tf->use_mmap) {
-            free_double_block_weights(&tf->double_blocks[i]);
-            /* With direct mmap pointers for bf16, no need to clear caches. */
-        }
         if (flux_substep_callback)
             flux_substep_callback(FLUX_SUBSTEP_DOUBLE_BLOCK, i, tf->num_double_layers);
 #ifdef DEBUG_TRANSFORMER
@@ -3459,8 +3499,9 @@ float *flux_transformer_forward(flux_transformer_t *tf,
     if (!bf16_path_ok && !gpu_chained_ok) {
 #endif
         for (int i = 0; i < tf->num_single_layers; i++) {
-            /* In mmap mode, load block weights on-demand */
-            if (tf->use_mmap) {
+            /* In mmap mode, load block weights on-demand (cached across steps) */
+            if (tf->use_mmap && tf->single_blocks[i].qkv_mlp_weight == NULL
+                             && tf->single_blocks[i].qkv_mlp_weight_bf16 == NULL) {
                 load_single_block_weights(&tf->single_blocks[i], tf->sf, i,
                                           tf->hidden_size, tf->mlp_hidden, tf->use_bf16);
             }
@@ -3479,11 +3520,6 @@ float *flux_transformer_forward(flux_transformer_t *tf,
                                      img_rope_cos, img_rope_sin,
                                      txt_rope_cos, txt_rope_sin,
                                      total_seq, txt_seq, tf);  /* txt_seq is the offset to image */
-            }
-            /* In mmap mode, free block weights after use */
-            if (tf->use_mmap) {
-                free_single_block_weights(&tf->single_blocks[i]);
-                /* With direct mmap pointers for bf16, no need to clear caches. */
             }
             if (flux_substep_callback)
                 flux_substep_callback(FLUX_SUBSTEP_SINGLE_BLOCK, i, tf->num_single_layers);
