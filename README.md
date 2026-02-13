@@ -1,6 +1,6 @@
-# Iris -- a C inference pipeline for image synthesis models
+# Iris - a C inference pipeline for image synthesis models
 
-Iris is an inference pipeline that generates images from text prompts using open weights diffision transformer models. It is implemented entirely in C, with zero external dependencies beyond the C standard library. MPS and BLAS acceleration are optional but recommended. Under macOS, a BLAS API is part of the system, so nothing is required.
+Iris is an inference pipeline that generates images from text prompts using open weights diffusion transformer models. It is implemented entirely in C, with zero external dependencies beyond the C standard library. MPS and BLAS acceleration are optional but recommended. Under macOS, a BLAS API is part of the system, so nothing is required.
 
 The name comes from the Greek goddess Iris, messenger of the gods and personification of the rainbow.
 
