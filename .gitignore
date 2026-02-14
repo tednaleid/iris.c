@@ -3,6 +3,10 @@
 
 # Compiled binaries
 flux
+iris
+
+# generated header files
+iris_shaders_source.h
 
 # Model weights (large files)
 flux-klein-*/

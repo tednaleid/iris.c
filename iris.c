@@ -1372,6 +1372,74 @@ iris_image *iris_img2img(iris_ctx *ctx, const char *prompt,
     return result;
 }
 
+/* Image-to-image with pre-computed text embeddings and image latent.
+ * Skips text encoding and VAE encoding — only runs noise init, sampling,
+ * and VAE decode. For batch generation with same prompt/image, different seeds.
+ *
+ * text_emb_uncond/text_seq_uncond: pass NULL/0 for distilled models.
+ * The caller owns the embedding and latent pointers (not freed here). */
+iris_image *iris_img2img_precomputed(iris_ctx *ctx,
+                                      const float *text_emb, int text_seq,
+                                      const float *text_emb_uncond, int text_seq_uncond,
+                                      const float *img_latent, int latent_h, int latent_w,
+                                      const iris_params *params) {
+    if (!ctx || !text_emb || !img_latent) {
+        set_error("Invalid parameters for precomputed img2img");
+        return NULL;
+    }
+
+    iris_params p = params ? *params : (iris_params)IRIS_PARAMS_DEFAULT;
+    if (p.num_steps <= 0) p.num_steps = ctx->default_steps;
+    float guidance = (p.guidance > 0) ? p.guidance : ctx->default_guidance;
+
+    if (!iris_load_transformer_if_needed(ctx)) return NULL;
+
+    int out_lat_h = p.height / 16;
+    int out_lat_w = p.width / 16;
+    int image_seq_len = out_lat_h * out_lat_w;
+
+    float *schedule = iris_selected_schedule(&p, image_seq_len);
+    int64_t seed = (p.seed < 0) ? (int64_t)time(NULL) : p.seed;
+    float *z = iris_init_noise(1, IRIS_LATENT_CHANNELS, out_lat_h, out_lat_w, seed);
+    int t_offset = 10;
+
+    float *latent;
+    if (ctx->is_distilled) {
+        latent = iris_sample_euler_refs_flux(
+            ctx->transformer, ctx->qwen3_encoder,
+            z, 1, IRIS_LATENT_CHANNELS, out_lat_h, out_lat_w,
+            img_latent, latent_h, latent_w, t_offset,
+            text_emb, text_seq,
+            schedule, p.num_steps, NULL);
+    } else {
+        latent = iris_sample_euler_cfg_refs_flux(
+            ctx->transformer, ctx->qwen3_encoder,
+            z, 1, IRIS_LATENT_CHANNELS, out_lat_h, out_lat_w,
+            img_latent, latent_h, latent_w, t_offset,
+            text_emb, text_seq,
+            text_emb_uncond, text_seq_uncond, guidance,
+            schedule, p.num_steps, NULL);
+    }
+
+    free(z);
+    free(schedule);
+
+    if (!latent) {
+        set_error("Sampling failed");
+        return NULL;
+    }
+
+    iris_image *result = NULL;
+    if (ctx->vae) {
+        if (iris_phase_callback) iris_phase_callback("decoding image", 0);
+        result = iris_vae_decode(ctx->vae, latent, 1, out_lat_h, out_lat_w);
+        if (iris_phase_callback) iris_phase_callback("decoding image", 1);
+    }
+
+    free(latent);
+    return result;
+}
+
 /* ========================================================================
  * Multi-Reference Generation
  * ======================================================================== */

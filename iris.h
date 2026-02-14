@@ -277,6 +277,20 @@ void iris_set_step_image_callback(iris_ctx *ctx, iris_step_image_cb_t callback);
  * ======================================================================== */
 
 /*
+ * Image-to-image with pre-computed text embeddings and image latent.
+ * Skips text encoding and VAE encoding — only runs sampling and VAE decode.
+ * For batch generation with same prompt/image but different seeds.
+ *
+ * text_emb_uncond/text_seq_uncond: pass NULL/0 for distilled models.
+ * The caller owns the embedding and latent pointers (not freed here).
+ */
+iris_image *iris_img2img_precomputed(iris_ctx *ctx,
+                                      const float *text_emb, int text_seq,
+                                      const float *text_emb_uncond, int text_seq_uncond,
+                                      const float *img_latent, int latent_h, int latent_w,
+                                      const iris_params *params);
+
+/*
  * Encode image to latent space using VAE encoder.
  * Returns latent tensor [1, 128, H/16, W/16].
  * Caller must free() the returned pointer.
