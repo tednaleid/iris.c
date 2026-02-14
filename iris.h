@@ -291,6 +291,22 @@ iris_image *iris_img2img_precomputed(iris_ctx *ctx,
                                       const iris_params *params);
 
 /*
+ * Multi-reference generation with pre-computed text embeddings and image latents.
+ * ref_latents/ref_hs/ref_ws are parallel arrays of num_refs pre-encoded images.
+ * RoPE T offsets are assigned automatically (10, 20, 30, ...).
+ * For single ref, dispatches to iris_img2img_precomputed.
+ *
+ * text_emb_uncond/text_seq_uncond: pass NULL/0 for distilled models.
+ * The caller owns all embedding and latent pointers (not freed here).
+ */
+iris_image *iris_multiref_precomputed(iris_ctx *ctx,
+                                       const float *text_emb, int text_seq,
+                                       const float *text_emb_uncond, int text_seq_uncond,
+                                       const float **ref_latents, const int *ref_hs,
+                                       const int *ref_ws, int num_refs,
+                                       const iris_params *params);
+
+/*
  * Encode image to latent space using VAE encoder.
  * Returns latent tensor [1, 128, H/16, W/16].
  * Caller must free() the returned pointer.
